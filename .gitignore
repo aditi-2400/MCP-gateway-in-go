@@ -1,0 +1,50 @@
+# Build output
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries and coverage
+*.test
+*.out
+coverage.*
+*.coverprofile
+
+# Go workspace files (local only)
+go.work
+go.work.sum
+
+# Fuzz test cache (corpus under testdata/fuzz is kept)
+/fuzz-cache/
+
+# Local SQLite audit databases
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+config.local.yaml
+
+# Personal notes and AI assistant instructions (kept local)
+/CLAUDE.md
+/PROGRESS.md
+
+# Logs
+*.log
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
