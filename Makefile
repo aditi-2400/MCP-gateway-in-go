@@ -11,8 +11,10 @@ build:
 test:
 	go test ./... -race
 
+# Go skips testdata folders in ./... patterns (even ./testdata/...), so the
+# fake servers there are listed by exact path.
 vet:
-	go vet ./...
+	go vet ./... ./testdata/fakeupstream
 
 fmt:
 	gofmt -w .
