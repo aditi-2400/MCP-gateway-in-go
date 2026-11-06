@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -156,19 +157,63 @@ func skipWithoutShell(t *testing.T) {
 	}
 }
 
-func TestRunForwardsRequestsUntilStdinCloses(t *testing.T) {
-	g := startGateway(t, context.Background(), "--", fakeUpstreamBin)
+// upstreamEntry is one upstream in a test config.
+type upstreamEntry struct {
+	name    string
+	command string
+	args    []string
+}
+
+// writeConfig writes a gateway config to a temp file and returns its path.
+// Values are JSON-quoted, which YAML accepts, so shell scripts with quotes
+// survive.
+func writeConfig(t *testing.T, upstreams ...upstreamEntry) string {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("upstreams:\n")
+	for _, u := range upstreams {
+		args, err := json.Marshal(append([]string{}, u.args...))
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&b, "  - name: %s\n    command: %q\n    args: %s\n", u.name, u.command, args)
+	}
+	path := filepath.Join(t.TempDir(), "gateway.yaml")
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func fakeConfig(t *testing.T, names ...string) string {
+	t.Helper()
+	entries := make([]upstreamEntry, len(names))
+	for i, name := range names {
+		entries[i] = upstreamEntry{name: name, command: fakeUpstreamBin}
+	}
+	return writeConfig(t, entries...)
+}
+
+// discoverThenExit is an upstream that passes the startup check (always
+// request id 1 on a new connection) and then exits.
+var discoverThenExit = upstreamEntry{name: "flaky", command: "sh", args: []string{"-c",
+	`read line; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}}}}'; sleep 0.2`}}
+
+func TestRunRoutesAcrossUpstreamsUntilStdinCloses(t *testing.T) {
+	g := startGateway(t, context.Background(), "-config", fakeConfig(t, "alpha", "beta"))
 
 	g.send(`{"jsonrpc":"2.0","id":"list-1","method":"tools/list","params":{` + validMeta + `}}`)
 	resp := g.next()
 	if resp.ID == nil || resp.ID.String() != `"list-1"` || resp.Error != nil {
 		t.Fatalf("tools/list response = id %v, error %v", resp.ID, resp.Error)
 	}
-	if !strings.Contains(string(resp.Result), `"name":"echo"`) {
-		t.Fatalf("tools/list result = %s, want the echo tool", resp.Result)
+	for _, want := range []string{`"name":"alpha__echo"`, `"name":"beta__echo"`} {
+		if !strings.Contains(string(resp.Result), want) {
+			t.Fatalf("tools/list result = %s, want %s", resp.Result, want)
+		}
 	}
 
-	g.send(`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"echo","arguments":{"text":"hi"},` + validMeta + `}}`)
+	g.send(`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"beta__echo","arguments":{"text":"hi"},` + validMeta + `}}`)
 	resp = g.next()
 	if resp.ID == nil || resp.ID.String() != "7" || !strings.Contains(string(resp.Result), `"text":"hi"`) {
 		t.Fatalf("tools/call response = id %v, result %s, error %v", resp.ID, resp.Result, resp.Error)
@@ -183,12 +228,12 @@ func TestRunForwardsRequestsUntilStdinCloses(t *testing.T) {
 	}
 }
 
-// Same as `echo request | gateway -- server`: stdin closes right after the
+// Same as `echo request | gateway -config ...`: stdin closes right after the
 // request, and the reply must still arrive.
 func TestRunRepliesWhenStdinClosesRightAway(t *testing.T) {
-	g := startGateway(t, context.Background(), "--", fakeUpstreamBin)
+	g := startGateway(t, context.Background(), "-config", fakeConfig(t, "fake"))
 
-	g.send(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add","arguments":{"a":2,"b":3},` + validMeta + `}}`)
+	g.send(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fake__add","arguments":{"a":2,"b":3},` + validMeta + `}}`)
 	g.in.Close()
 
 	if resp := g.next(); resp.Error != nil || !strings.Contains(string(resp.Result), `"sum":5`) {
@@ -201,7 +246,7 @@ func TestRunRepliesWhenStdinClosesRightAway(t *testing.T) {
 
 func TestRunStopsCleanlyWhenContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	g := startGateway(t, ctx, "--", fakeUpstreamBin)
+	g := startGateway(t, ctx, "-config", fakeConfig(t, "fake"))
 
 	// A round trip proves the gateway is up before it is stopped.
 	g.send(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{` + validMeta + `}}`)
@@ -216,18 +261,46 @@ func TestRunStopsCleanlyWhenContextCancelled(t *testing.T) {
 	}
 }
 
-func TestRunFailsWhenUpstreamExits(t *testing.T) {
+func TestRunFailsWhenAnUpstreamExits(t *testing.T) {
 	skipWithoutShell(t)
-	g := startGateway(t, context.Background(), "--", "sh", "-c", "exit 0")
+	cfg := writeConfig(t, upstreamEntry{name: "steady", command: fakeUpstreamBin}, discoverThenExit)
+	g := startGateway(t, context.Background(), "-config", cfg)
 
 	err := g.wait()
-	if !errors.Is(err, errUpstreamExited) {
-		t.Fatalf("run() error = %v, want errUpstreamExited", err)
+	if !errors.Is(err, errUpstreamExited) || !strings.Contains(err.Error(), `"flaky"`) {
+		t.Fatalf("run() error = %v, want errUpstreamExited naming \"flaky\"", err)
+	}
+}
+
+func TestRunRefusesToStartWhenAnUpstreamFails(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "no-such-server")
+	cfg := writeConfig(t,
+		upstreamEntry{name: "good", command: fakeUpstreamBin},
+		upstreamEntry{name: "broken", command: missing},
+	)
+	err := run(context.Background(), []string{"-config", cfg}, strings.NewReader(""), io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), `"broken"`) {
+		t.Fatalf("run() error = %v, want an error naming \"broken\"", err)
+	}
+}
+
+func TestRunRejectsBadConfig(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.yaml")
+	bad := filepath.Join(t.TempDir(), "bad.yaml")
+	if err := os.WriteFile(bad, []byte("upstreams:\n  - name: Bad_Name\n    command: x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{missing, bad} {
+		err := run(context.Background(), []string{"-config", path}, strings.NewReader(""), io.Discard, io.Discard)
+		if err == nil || errors.Is(err, errUsage) || !strings.Contains(err.Error(), path) {
+			t.Errorf("run(%s) error = %v, want a config error naming the file", path, err)
+		}
 	}
 }
 
 func TestRunDoesNotLogUpstreamArgs(t *testing.T) {
-	g := startGateway(t, context.Background(), "--", fakeUpstreamBin, "--token=secret-value")
+	cfg := writeConfig(t, upstreamEntry{name: "fake", command: fakeUpstreamBin, args: []string{"--token=secret-value"}})
+	g := startGateway(t, context.Background(), "-config", cfg)
 	g.in.Close()
 	if err := g.wait(); err != nil {
 		t.Fatalf("run() error = %v", err)
@@ -237,40 +310,32 @@ func TestRunDoesNotLogUpstreamArgs(t *testing.T) {
 	}
 }
 
-func TestRunStartFailure(t *testing.T) {
-	missing := filepath.Join(t.TempDir(), "no-such-server")
-	err := run(context.Background(), []string{"--", missing}, strings.NewReader(""), io.Discard, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "start") {
-		t.Fatalf("run() error = %v, want a start error", err)
-	}
-}
-
 func TestParseFlags(t *testing.T) {
 	tests := []struct {
 		name        string
 		args        []string
 		wantErr     error
-		wantPath    string
-		wantArgs    []string
+		wantConfig  string
 		wantTimeout time.Duration
 	}{
-		{name: "command only", args: []string{"--", "server"}, wantPath: "server", wantArgs: []string{}, wantTimeout: 60 * time.Second},
-		{name: "command with args", args: []string{"--", "server", "-v", "x"}, wantPath: "server", wantArgs: []string{"-v", "x"}, wantTimeout: 60 * time.Second},
-		{name: "no separator", args: []string{"server", "-v"}, wantPath: "server", wantArgs: []string{"-v"}, wantTimeout: 60 * time.Second},
-		{name: "timeout flag", args: []string{"-call-timeout", "2s", "--", "server"}, wantPath: "server", wantArgs: []string{}, wantTimeout: 2 * time.Second},
-		{name: "log level flag", args: []string{"-log-level", "debug", "--", "server"}, wantPath: "server", wantArgs: []string{}, wantTimeout: 60 * time.Second},
-		{name: "missing command", args: nil, wantErr: errUsage},
-		{name: "only separator", args: []string{"--"}, wantErr: errUsage},
-		{name: "zero timeout", args: []string{"-call-timeout", "0s", "--", "server"}, wantErr: errUsage},
-		{name: "negative timeout", args: []string{"-call-timeout", "-1s", "--", "server"}, wantErr: errUsage},
-		{name: "bad timeout", args: []string{"-call-timeout", "soon", "--", "server"}, wantErr: errUsage},
-		{name: "bad log level", args: []string{"-log-level", "loud", "--", "server"}, wantErr: errUsage},
-		{name: "unknown flag", args: []string{"-nope", "--", "server"}, wantErr: errUsage},
+		{name: "config only", args: []string{"-config", "g.yaml"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second},
+		{name: "config with equals", args: []string{"-config=g.yaml"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second},
+		{name: "timeout flag", args: []string{"-config", "g.yaml", "-call-timeout", "2s"}, wantConfig: "g.yaml", wantTimeout: 2 * time.Second},
+		{name: "log level flag", args: []string{"-log-level", "debug", "-config", "g.yaml"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second},
+		{name: "missing config", args: nil, wantErr: errUsage},
+		{name: "empty config", args: []string{"-config", ""}, wantErr: errUsage},
+		{name: "old command form", args: []string{"--", "server"}, wantErr: errUsage},
+		{name: "extra arguments", args: []string{"-config", "g.yaml", "server"}, wantErr: errUsage},
+		{name: "zero timeout", args: []string{"-config", "g.yaml", "-call-timeout", "0s"}, wantErr: errUsage},
+		{name: "negative timeout", args: []string{"-config", "g.yaml", "-call-timeout", "-1s"}, wantErr: errUsage},
+		{name: "bad timeout", args: []string{"-config", "g.yaml", "-call-timeout", "soon"}, wantErr: errUsage},
+		{name: "bad log level", args: []string{"-config", "g.yaml", "-log-level", "loud"}, wantErr: errUsage},
+		{name: "unknown flag", args: []string{"-nope", "-config", "g.yaml"}, wantErr: errUsage},
 		{name: "help", args: []string{"-h"}, wantErr: flag.ErrHelp},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg, err := parseFlags(tt.args, io.Discard)
+			f, err := parseFlags(tt.args, io.Discard)
 			if tt.wantErr != nil {
 				if !errors.Is(err, tt.wantErr) {
 					t.Fatalf("parseFlags() error = %v, want %v", err, tt.wantErr)
@@ -280,11 +345,11 @@ func TestParseFlags(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parseFlags() error = %v", err)
 			}
-			if cfg.upstream.Path != tt.wantPath || strings.Join(cfg.upstream.Args, " ") != strings.Join(tt.wantArgs, " ") {
-				t.Errorf("upstream = %+v, want path %q args %q", cfg.upstream, tt.wantPath, tt.wantArgs)
+			if f.configPath != tt.wantConfig {
+				t.Errorf("configPath = %q, want %q", f.configPath, tt.wantConfig)
 			}
-			if cfg.callTimeout != tt.wantTimeout {
-				t.Errorf("callTimeout = %v, want %v", cfg.callTimeout, tt.wantTimeout)
+			if f.callTimeout != tt.wantTimeout {
+				t.Errorf("callTimeout = %v, want %v", f.callTimeout, tt.wantTimeout)
 			}
 		})
 	}

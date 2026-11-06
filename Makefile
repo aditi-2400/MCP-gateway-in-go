@@ -32,7 +32,7 @@ check: fmt-check vet test
 # Runs the gateway in front of the fake upstream. Type JSON-RPC lines into it.
 run: build
 	go build -o $(BIN_DIR)/fakeupstream ./testdata/fakeupstream
-	$(GATEWAY) -- $(BIN_DIR)/fakeupstream
+	$(GATEWAY) -config testdata/config/example.yaml
 
 clean:
 	rm -rf $(BIN_DIR)

@@ -7,13 +7,14 @@ import (
 	"errors"
 	"io"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
-	"github.com/aditi-2400/MCP-gateway-in-go/internal/fakeupstream"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/mcp"
 )
 
 // gatewayProcess is a running gateway binary with pipes to its stdio.
@@ -117,7 +118,9 @@ func (g *gatewayProcess) exitCode() int {
 }
 
 func TestBinaryEndToEnd(t *testing.T) {
-	g := startGatewayProcess(t, "--", fakeUpstreamBin)
+	// Two copies of the fake server have the same tool names, so every name
+	// collides unless the gateway prefixes them.
+	g := startGatewayProcess(t, "-config", fakeConfig(t, "alpha", "beta"))
 
 	// Requests go one at a time, because the gateway may answer concurrent
 	// requests in any order.
@@ -127,47 +130,57 @@ func TestBinaryEndToEnd(t *testing.T) {
 		check func(t *testing.T, resp *jsonrpc.Message)
 	}{
 		{
-			name: "server/discover",
+			name: "server/discover is answered by the gateway",
 			send: `{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{` + validMeta + `}}`,
 			check: func(t *testing.T, resp *jsonrpc.Message) {
 				wantResult(t, resp, jsonrpc.NewIntID(1), `"supportedVersions":["2026-07-28"]`)
+				wantResult(t, resp, jsonrpc.NewIntID(1), `"name":"mcp-gateway"`)
 			},
 		},
 		{
-			name: "tools/list",
+			name: "tools/list merges both upstreams with prefixes",
 			send: `{"jsonrpc":"2.0","id":"list","method":"tools/list","params":{` + validMeta + `}}`,
 			check: func(t *testing.T, resp *jsonrpc.Message) {
-				for _, tool := range []string{`"name":"echo"`, `"name":"add"`, `"name":"fail"`} {
-					wantResult(t, resp, jsonrpc.NewStringID("list"), tool)
+				for _, tool := range []string{"echo", "add", "fail"} {
+					for _, up := range []string{"alpha", "beta"} {
+						wantResult(t, resp, jsonrpc.NewStringID("list"), `"name":"`+up+`__`+tool+`"`)
+					}
 				}
 			},
 		},
 		{
-			name: "tools/call add",
-			send: `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add","arguments":{"a":2,"b":3},` + validMeta + `}}`,
+			name: "tools/call routes by prefix",
+			send: `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"alpha__add","arguments":{"a":2,"b":3},` + validMeta + `}}`,
 			check: func(t *testing.T, resp *jsonrpc.Message) {
 				wantResult(t, resp, jsonrpc.NewIntID(3), `"structuredContent":{"sum":5}`)
 			},
 		},
 		{
 			name: "tool error is a result with isError",
-			send: `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fail","arguments":{},` + validMeta + `}}`,
+			send: `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"beta__fail","arguments":{},` + validMeta + `}}`,
 			check: func(t *testing.T, resp *jsonrpc.Message) {
 				wantResult(t, resp, jsonrpc.NewIntID(4), `"isError":true`)
 			},
 		},
 		{
-			name: "unknown tool is a protocol error",
-			send: `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"nope","arguments":{},` + validMeta + `}}`,
+			name: "unknown tool on a known upstream is a protocol error",
+			send: `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"alpha__nope","arguments":{},` + validMeta + `}}`,
 			check: func(t *testing.T, resp *jsonrpc.Message) {
 				wantError(t, resp, ptr(jsonrpc.NewIntID(5)), jsonrpc.CodeInvalidParams)
 			},
 		},
 		{
-			name: "unsupported protocol version passes through",
-			send: `{"jsonrpc":"2.0","id":6,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-06-18","io.modelcontextprotocol/clientCapabilities":{}}}}`,
+			name: "unknown upstream prefix is a protocol error",
+			send: `{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"gamma__echo","arguments":{},` + validMeta + `}}`,
 			check: func(t *testing.T, resp *jsonrpc.Message) {
-				wantError(t, resp, ptr(jsonrpc.NewIntID(6)), fakeupstream.CodeUnsupportedProtocolVersion)
+				wantError(t, resp, ptr(jsonrpc.NewIntID(6)), jsonrpc.CodeInvalidParams)
+			},
+		},
+		{
+			name: "unsupported protocol version is rejected by the gateway",
+			send: `{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-06-18","io.modelcontextprotocol/clientCapabilities":{}}}}`,
+			check: func(t *testing.T, resp *jsonrpc.Message) {
+				wantError(t, resp, ptr(jsonrpc.NewIntID(7)), mcp.CodeUnsupportedProtocolVersion)
 				if !strings.Contains(string(resp.Error.Data), `"requested":"2025-06-18"`) {
 					t.Errorf("error data = %s, want the requested version", resp.Error.Data)
 				}
@@ -175,7 +188,7 @@ func TestBinaryEndToEnd(t *testing.T) {
 		},
 		{
 			name: "bad JSON gets a parse error with null id",
-			send: `{"jsonrpc":"2.0","id":7,`,
+			send: `{"jsonrpc":"2.0","id":8,`,
 			check: func(t *testing.T, resp *jsonrpc.Message) {
 				wantError(t, resp, nil, jsonrpc.CodeParseError)
 			},
@@ -185,9 +198,9 @@ func TestBinaryEndToEnd(t *testing.T) {
 			// answer to the request sent after it.
 			name: "notification gets no reply",
 			send: `{"jsonrpc":"2.0","method":"notifications/progress","params":{}}` + "\n" +
-				`{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"echo","arguments":{"text":"still here"},` + validMeta + `}}`,
+				`{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"beta__echo","arguments":{"text":"still here"},` + validMeta + `}}`,
 			check: func(t *testing.T, resp *jsonrpc.Message) {
-				wantResult(t, resp, jsonrpc.NewIntID(8), `"text":"still here"`)
+				wantResult(t, resp, jsonrpc.NewIntID(9), `"text":"still here"`)
 			},
 		},
 	}
@@ -215,20 +228,31 @@ func TestBinaryExitCodes(t *testing.T) {
 		if code := g.exitCode(); code != 2 {
 			t.Fatalf("exit code = %d, want 2", code)
 		}
-		if !strings.Contains(g.stderr.String(), "missing upstream command") {
+		if !strings.Contains(g.stderr.String(), "missing -config") {
 			t.Errorf("stderr = %q, want the usage problem", g.stderr)
 		}
 	})
 
+	t.Run("failed upstream start exits 1", func(t *testing.T) {
+		cfg := writeConfig(t, upstreamEntry{name: "broken", command: filepath.Join(t.TempDir(), "missing")})
+		g := startGatewayProcess(t, "-config", cfg)
+		if code := g.exitCode(); code != 1 {
+			t.Fatalf("exit code = %d, want 1\nstderr:\n%s", code, g.stderr)
+		}
+		if !strings.Contains(g.stderr.String(), `"broken"`) {
+			t.Errorf("stderr = %q, want the failed upstream named", g.stderr)
+		}
+	})
+
 	t.Run("upstream exit exits 1", func(t *testing.T) {
-		g := startGatewayProcess(t, "--", "sh", "-c", "exit 0")
+		g := startGatewayProcess(t, "-config", writeConfig(t, discoverThenExit))
 		if code := g.exitCode(); code != 1 {
 			t.Fatalf("exit code = %d, want 1\nstderr:\n%s", code, g.stderr)
 		}
 	})
 
 	t.Run("SIGTERM exits 0", func(t *testing.T) {
-		g := startGatewayProcess(t, "--", fakeUpstreamBin)
+		g := startGatewayProcess(t, "-config", fakeConfig(t, "fake"))
 		g.send(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{` + validMeta + `}}`)
 		g.next()
 
