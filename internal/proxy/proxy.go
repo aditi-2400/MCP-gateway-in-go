@@ -64,9 +64,12 @@ func New(up Upstream, opts Options) *Proxy {
 	}
 }
 
-// Serve reads client messages from in and writes replies to out. It returns
-// nil when in reaches EOF, or an error when ctx is done or a read or write
-// fails. Before returning it cancels in-flight requests and waits for them.
+// Serve reads client messages from in and writes replies to out.
+//
+// When in reaches EOF, Serve stops reading but lets in-flight requests finish
+// (each still bounded by CallTimeout), because the client can still read
+// replies. It then returns nil. If ctx is done or a read or write fails, Serve
+// cancels in-flight requests, waits for them, and returns the error.
 //
 // Reading in cannot be interrupted, so if Serve returns because ctx is done,
 // one goroutine stays blocked on in until it is closed.
@@ -83,6 +86,11 @@ func (p *Proxy) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
 	defer p.setClient(nil)
 
 	err := s.run(jsonrpc.NewReader(in, p.maxMessageSize))
+	if err == nil {
+		// Client EOF. It may still be reading, so let in-flight requests reply.
+		s.drain()
+		err = context.Cause(ctx)
+	}
 	// Nobody will read replies to in-flight requests now, so stop them.
 	cancel(err)
 	s.wg.Wait()
@@ -258,6 +266,20 @@ func (s *session) startRequest(req *jsonrpc.Message) {
 			s.write(resp)
 		}
 	}()
+}
+
+// drain waits for in-flight requests to finish, or for the session to be
+// cancelled. Only call it after run returns, so no new requests start.
+func (s *session) drain() {
+	finished := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(finished)
+	}()
+	select {
+	case <-finished:
+	case <-s.ctx.Done():
+	}
 }
 
 func (s *session) untrack(id jsonrpc.ID) {

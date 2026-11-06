@@ -328,17 +328,71 @@ func TestSlowCallDoesNotBlockOthers(t *testing.T) {
 	}
 }
 
-func TestClientEOFCancelsInFlightAndReturns(t *testing.T) {
+// A client may close its input right after sending, as `echo req | gateway`
+// does, and still read the replies.
+func TestClientEOFWaitsForInFlightReplies(t *testing.T) {
 	started := make(chan struct{}, 1)
-	stopped := make(chan error, 1)
-	c, _ := newClient(t, &fakeUpstream{call: blockUntilCancelled(started, stopped)}, Options{})
+	release := make(chan struct{})
+	up := &fakeUpstream{call: func(ctx context.Context, _ string, _ json.RawMessage) (*jsonrpc.Message, error) {
+		started <- struct{}{}
+		select {
+		case <-release:
+			return jsonrpc.NewResult(jsonrpc.NewIntID(99), json.RawMessage(`{"ok":true}`)), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}}
+	c, _ := newClient(t, up, Options{})
 
 	c.send(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}`)
 	wait(t, started, "call to start")
 	c.in.Close()
 
+	select {
+	case err := <-c.served:
+		t.Fatalf("Serve() returned %v right after EOF, want it to wait for the call", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+
+	if resp := c.next(); resp.Error != nil || *resp.ID != jsonrpc.NewIntID(1) || string(resp.Result) != `{"ok":true}` {
+		t.Fatalf("response = %+v, want the result for id 1", resp)
+	}
 	if err := c.waitServed(); err != nil {
 		t.Fatalf("Serve() error = %v, want nil on client EOF", err)
+	}
+}
+
+func TestClientEOFStillAppliesCallTimeout(t *testing.T) {
+	started := make(chan struct{}, 1)
+	stopped := make(chan error, 1)
+	c, _ := newClient(t, &fakeUpstream{call: blockUntilCancelled(started, stopped)}, Options{CallTimeout: 50 * time.Millisecond})
+
+	c.send(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}`)
+	wait(t, started, "call to start")
+	c.in.Close()
+
+	if resp := c.next(); resp.Error == nil || resp.Error.Message != "upstream timed out" {
+		t.Fatalf("response = %+v, want upstream timed out", resp)
+	}
+	if err := c.waitServed(); err != nil {
+		t.Fatalf("Serve() error = %v, want nil on client EOF", err)
+	}
+}
+
+func TestContextCancelAfterEOFStopsInFlight(t *testing.T) {
+	started := make(chan struct{}, 1)
+	stopped := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	c := startProxy(t, New(&fakeUpstream{call: blockUntilCancelled(started, stopped)}, Options{}), ctx)
+
+	c.send(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}`)
+	wait(t, started, "call to start")
+	c.in.Close()
+	cancel()
+
+	if err := c.waitServed(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Serve() error = %v, want context.Canceled", err)
 	}
 	if err := wait(t, stopped, "call to stop"); !errors.Is(err, context.Canceled) {
 		t.Errorf("in-flight call saw %v, want context.Canceled", err)
