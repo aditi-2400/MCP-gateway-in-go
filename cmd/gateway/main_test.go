@@ -23,8 +23,9 @@ const testTimeout = 5 * time.Second
 
 const validMeta = `"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}`
 
-// fakeUpstreamBin is the fake MCP server binary, built once in TestMain.
-var fakeUpstreamBin string
+// Binaries built once in TestMain: the fake MCP server, and the gateway
+// itself for the end-to-end tests.
+var fakeUpstreamBin, gatewayBin string
 
 func TestMain(m *testing.M) {
 	os.Exit(runTests(m))
@@ -39,10 +40,17 @@ func runTests(m *testing.M) int {
 	defer os.RemoveAll(dir)
 
 	fakeUpstreamBin = filepath.Join(dir, "fakeupstream")
-	build := exec.Command("go", "build", "-o", fakeUpstreamBin, "../../testdata/fakeupstream")
-	if out, err := build.CombinedOutput(); err != nil {
-		fmt.Fprintf(os.Stderr, "build fake upstream: %v\n%s", err, out)
-		return 1
+	gatewayBin = filepath.Join(dir, "gateway")
+	builds := map[string]string{
+		fakeUpstreamBin: "../../testdata/fakeupstream",
+		gatewayBin:      ".",
+	}
+	for out, pkg := range builds {
+		build := exec.Command("go", "build", "-o", out, pkg)
+		if output, err := build.CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "build %s: %v\n%s", pkg, err, output)
+			return 1
+		}
 	}
 	return m.Run()
 }
