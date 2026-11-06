@@ -166,7 +166,7 @@ func TestRequestsWithBadMetaNeverReachUpstreams(t *testing.T) {
 func TestUnsupportedMethods(t *testing.T) {
 	up := listing()
 	r := newRouter(t, Named{Name: "fs", Upstream: up})
-	for _, method := range []string{"initialize", "resources/list", "prompts/get", "nope"} {
+	for _, method := range []string{"initialize", "resources/list", "prompts/get", "tools/calls", "nope"} {
 		t.Run(method, func(t *testing.T) {
 			wantCode(t, call(t, r, method, clientListParams), jsonrpc.CodeMethodNotFound)
 		})
@@ -397,6 +397,150 @@ func TestToolsListAsksUpstreamsConcurrently(t *testing.T) {
 		}
 	case <-time.After(testTimeout):
 		t.Fatal("tools/list did not finish; upstreams were not asked concurrently")
+	}
+}
+
+func callParams(fields string) json.RawMessage {
+	return json.RawMessage(`{` + fields + `,"_meta":` + validMeta + `}`)
+}
+
+func TestToolsCallRoutesByPrefixAndStripsIt(t *testing.T) {
+	answer := func(json.RawMessage) (*jsonrpc.Message, error) {
+		return result(`{"resultType":"complete","content":[]}`), nil
+	}
+	fs := &fakeUpstream{answer: answer}
+	gh := &fakeUpstream{answer: answer}
+	r := newRouter(t, Named{Name: "fs", Upstream: fs}, Named{Name: "github", Upstream: gh})
+
+	tests := []struct {
+		name     string
+		params   json.RawMessage
+		wantUp   *fakeUpstream
+		wantTool string
+	}{
+		{name: "simple", params: callParams(`"name":"github__search","arguments":{"q":"x"}`), wantUp: gh, wantTool: "search"},
+		{name: "tool name with underscores", params: callParams(`"name":"fs__read_file","arguments":{}`), wantUp: fs, wantTool: "read_file"},
+		{name: "tool name containing the separator", params: callParams(`"name":"fs__a__b"`), wantUp: fs, wantTool: "a__b"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := len(tt.wantUp.callLog())
+			resp := call(t, r, "tools/call", tt.params)
+			if resp.Error != nil {
+				t.Fatalf("error = %v", resp.Error)
+			}
+			calls := tt.wantUp.callLog()
+			if len(calls) != before+1 {
+				t.Fatalf("upstream got %d new calls, want 1", len(calls)-before)
+			}
+			method, params, _ := strings.Cut(calls[len(calls)-1], " ")
+			if method != "tools/call" {
+				t.Fatalf("method = %s, want tools/call", method)
+			}
+			var sent map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(params), &sent); err != nil {
+				t.Fatal(err)
+			}
+			if string(sent["name"]) != `"`+tt.wantTool+`"` {
+				t.Errorf("upstream saw name %s, want %q", sent["name"], tt.wantTool)
+			}
+		})
+	}
+	if len(fs.callLog())+len(gh.callLog()) != len(tests) {
+		t.Errorf("total upstream calls = %d, want %d (no cross routing)", len(fs.callLog())+len(gh.callLog()), len(tests))
+	}
+}
+
+func TestToolsCallKeepsOtherParamsUnchanged(t *testing.T) {
+	up := &fakeUpstream{answer: func(json.RawMessage) (*jsonrpc.Message, error) { return result(`{}`), nil }}
+	r := newRouter(t, Named{Name: "fs", Upstream: up})
+
+	// inputResponses and requestState are how a client retries after an
+	// input_required result; they must reach the upstream as sent.
+	params := callParams(`"name":"fs__login","arguments":{"user":"a","n":[1,2]},"inputResponses":{"k":{"action":"accept"}},"requestState":"opaque=="`)
+	call(t, r, "tools/call", params)
+
+	var original, sent map[string]json.RawMessage
+	if err := json.Unmarshal(params, &original); err != nil {
+		t.Fatal(err)
+	}
+	_, sentParams, _ := strings.Cut(up.callLog()[0], " ")
+	if err := json.Unmarshal([]byte(sentParams), &sent); err != nil {
+		t.Fatal(err)
+	}
+	if len(sent) != len(original) {
+		t.Fatalf("upstream params have %d fields, want %d: %s", len(sent), len(original), sentParams)
+	}
+	for key, value := range original {
+		if key != "name" && string(sent[key]) != string(value) {
+			t.Errorf("field %s = %s, want %s", key, sent[key], value)
+		}
+	}
+}
+
+func TestToolsCallPassesUpstreamAnswersThrough(t *testing.T) {
+	upstreamErr := &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: "Unknown tool: nope", Data: json.RawMessage(`{"x":1}`)}
+	tests := []struct {
+		name   string
+		answer *jsonrpc.Message
+	}{
+		{name: "result", answer: result(`{"resultType":"complete","content":[{"type":"text","text":"hi"}]}`)},
+		{name: "tool error result", answer: result(`{"resultType":"complete","content":[],"isError":true}`)},
+		{name: "input required", answer: result(`{"resultType":"input_required","inputRequests":{},"requestState":"s"}`)},
+		{name: "protocol error", answer: &jsonrpc.Message{Error: upstreamErr}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			up := &fakeUpstream{answer: func(json.RawMessage) (*jsonrpc.Message, error) { return tt.answer, nil }}
+			r := newRouter(t, Named{Name: "fs", Upstream: up})
+
+			resp := call(t, r, "tools/call", callParams(`"name":"fs__x"`))
+			if string(resp.Result) != string(tt.answer.Result) || resp.Error != tt.answer.Error {
+				t.Fatalf("response = result %s, error %v, want result %s, error %v", resp.Result, resp.Error, tt.answer.Result, tt.answer.Error)
+			}
+		})
+	}
+}
+
+func TestToolsCallReturnsUpstreamFailureAsError(t *testing.T) {
+	r := newRouter(t, Named{Name: "fs", Upstream: failing(upstream.ErrClosed)})
+	resp, err := r.Call(context.Background(), "tools/call", callParams(`"name":"fs__x"`))
+	if !errors.Is(err, upstream.ErrClosed) || resp != nil {
+		t.Fatalf("Call() = %v, %v, want nil and ErrClosed", resp, err)
+	}
+}
+
+func TestToolsCallBadNamesNeverReachUpstreams(t *testing.T) {
+	up := &fakeUpstream{answer: func(json.RawMessage) (*jsonrpc.Message, error) { return result(`{}`), nil }}
+	r := newRouter(t, Named{Name: "fs", Upstream: up})
+
+	tests := []struct {
+		name   string
+		params json.RawMessage
+	}{
+		{name: "no prefix", params: callParams(`"name":"read_file"`)},
+		{name: "unknown prefix", params: callParams(`"name":"db__query"`)},
+		{name: "prefix differs in case", params: callParams(`"name":"FS__read_file"`)},
+		{name: "empty tool part", params: callParams(`"name":"fs__"`)},
+		{name: "empty prefix", params: callParams(`"name":"__read_file"`)},
+		{name: "single underscore", params: callParams(`"name":"fs_read_file"`)},
+		{name: "missing name", params: callParams(`"arguments":{}`)},
+		{name: "empty name", params: callParams(`"name":""`)},
+		{name: "name is a number", params: callParams(`"name":7`)},
+		{name: "name is null", params: callParams(`"name":null`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wantCode(t, call(t, r, "tools/call", tt.params), jsonrpc.CodeInvalidParams)
+		})
+	}
+
+	oldVersion := json.RawMessage(`{"name":"fs__x","_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25","io.modelcontextprotocol/clientCapabilities":{}}}`)
+	wantCode(t, call(t, r, "tools/call", oldVersion), mcp.CodeUnsupportedProtocolVersion)
+	wantCode(t, call(t, r, "tools/call", json.RawMessage(`{"name":"fs__x"}`)), jsonrpc.CodeInvalidParams)
+
+	if calls := up.callLog(); len(calls) != 0 {
+		t.Errorf("upstream got calls %v, want none", calls)
 	}
 }
 

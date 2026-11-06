@@ -1,7 +1,7 @@
 // Package router is the gateway's MCP server logic for several upstreams. It
 // answers server/discover itself, merges tools/list from every upstream with
-// each tool name prefixed by its upstream's name, and rejects methods it
-// cannot route.
+// each tool name prefixed by its upstream's name, sends tools/call to the
+// upstream its prefix names, and rejects methods it cannot route.
 package router
 
 import (
@@ -51,6 +51,7 @@ type Options struct {
 // concurrent use.
 type Router struct {
 	upstreams []Named // in config order, which is the order tools are listed in
+	byName    map[string]Upstream
 	maxPages  int
 	logger    *slog.Logger
 }
@@ -61,19 +62,20 @@ func New(upstreams []Named, opts Options) (*Router, error) {
 	if len(upstreams) == 0 {
 		return nil, errors.New("router: no upstreams")
 	}
-	seen := make(map[string]bool, len(upstreams))
+	byName := make(map[string]Upstream, len(upstreams))
 	for _, u := range upstreams {
+		_, duplicate := byName[u.Name]
 		switch {
 		case u.Name == "":
 			return nil, errors.New("router: upstream with empty name")
 		case strings.Contains(u.Name, "_"):
 			return nil, fmt.Errorf("router: upstream name %q contains '_'", u.Name)
-		case seen[u.Name]:
+		case duplicate:
 			return nil, fmt.Errorf("router: duplicate upstream name %q", u.Name)
 		case u.Upstream == nil:
 			return nil, fmt.Errorf("router: upstream %q is nil", u.Name)
 		}
-		seen[u.Name] = true
+		byName[u.Name] = u.Upstream
 	}
 
 	if opts.MaxPages <= 0 {
@@ -84,6 +86,7 @@ func New(upstreams []Named, opts Options) (*Router, error) {
 	}
 	return &Router{
 		upstreams: append([]Named(nil), upstreams...),
+		byName:    byName,
 		maxPages:  opts.MaxPages,
 		logger:    opts.Logger,
 	}, nil
@@ -104,6 +107,11 @@ func (r *Router) Call(ctx context.Context, method string, params json.RawMessage
 			return errorMessage(rpcErr), nil
 		}
 		return r.listTools(ctx, params)
+	case "tools/call":
+		if rpcErr := mcp.CheckMeta(params); rpcErr != nil {
+			return errorMessage(rpcErr), nil
+		}
+		return r.callTool(ctx, params)
 	default:
 		return errorMessage(&jsonrpc.Error{Code: jsonrpc.CodeMethodNotFound, Message: "Method not found: " + method}), nil
 	}
@@ -281,6 +289,45 @@ func prefixTool(prefix string, raw json.RawMessage) (string, json.RawMessage, er
 		return "", nil, fmt.Errorf("encode tool: %w", err)
 	}
 	return full, tool, nil
+}
+
+// callTool sends a tools/call to the upstream named by the tool's prefix,
+// with the prefix removed. The upstream's answer comes back unchanged. It is
+// never retried, since the tool may have side effects.
+func (r *Router) callTool(ctx context.Context, params json.RawMessage) (*jsonrpc.Message, error) {
+	// A map keeps every other field (arguments, _meta, requestState, ...)
+	// exactly as the client sent it.
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(params, &fields); err != nil {
+		return errorMessage(&jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: "invalid tools/call params"}), nil
+	}
+	var name string
+	if err := json.Unmarshal(fields["name"], &name); err != nil || name == "" {
+		return errorMessage(&jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: "tools/call needs a tool name"}), nil
+	}
+
+	// Upstream names have no '_', so the prefix always ends at the first "__".
+	prefix, tool, found := strings.Cut(name, Separator)
+	up, known := r.byName[prefix]
+	if !found || !known || tool == "" {
+		return errorMessage(&jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: "Unknown tool: " + name}), nil
+	}
+
+	encodedTool, err := json.Marshal(tool)
+	if err != nil {
+		return nil, fmt.Errorf("router: encode tool name: %w", err)
+	}
+	fields["name"] = encodedTool
+	forwarded, err := json.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("router: encode tools/call params: %w", err)
+	}
+
+	resp, err := up.Call(ctx, "tools/call", forwarded)
+	if err != nil {
+		return nil, fmt.Errorf("router: %s: %w", prefix, err)
+	}
+	return resp, nil
 }
 
 func resultMessage(v any) (*jsonrpc.Message, error) {
