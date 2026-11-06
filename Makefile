@@ -29,8 +29,10 @@ fmt-check:
 # Everything that must pass before a change is done.
 check: fmt-check vet test
 
-run:
-	go run ./cmd/gateway
+# Runs the gateway in front of the fake upstream. Type JSON-RPC lines into it.
+run: build
+	go build -o $(BIN_DIR)/fakeupstream ./testdata/fakeupstream
+	$(GATEWAY) -- $(BIN_DIR)/fakeupstream
 
 clean:
 	rm -rf $(BIN_DIR)
