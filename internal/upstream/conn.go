@@ -20,6 +20,10 @@ import (
 // stage before escalating.
 const DefaultShutdownTimeout = 5 * time.Second
 
+// DefaultStartupTimeout is how long StartGroup waits for a new upstream to
+// answer its startup check.
+const DefaultStartupTimeout = 10 * time.Second
+
 // ErrClosed is returned for calls on a connection whose upstream has gone away.
 var ErrClosed = errors.New("upstream: connection closed")
 
@@ -29,6 +33,8 @@ type Options struct {
 	MaxMessageSize int
 	// ShutdownTimeout is used by Process.Close.
 	ShutdownTimeout time.Duration
+	// StartupTimeout limits StartGroup's check of each new upstream.
+	StartupTimeout time.Duration
 	// OnNotification receives notifications sent by the upstream. It runs on
 	// the read loop, so it must not block.
 	OnNotification func(*jsonrpc.Message)
@@ -44,6 +50,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.ShutdownTimeout <= 0 {
 		o.ShutdownTimeout = DefaultShutdownTimeout
+	}
+	if o.StartupTimeout <= 0 {
+		o.StartupTimeout = DefaultStartupTimeout
 	}
 	if o.Logger == nil {
 		o.Logger = slog.New(slog.DiscardHandler)
