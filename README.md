@@ -67,6 +67,7 @@ internal/jsonrpc/       message types, validation, newline framing, errors
 internal/upstream/      start and talk to upstream servers
 internal/proxy/         forward messages between client and upstream
 internal/fakeupstream/  fake MCP server used in tests
+internal/config/        YAML config loading and validation
 internal/auth/          API key identification (planned)
 internal/policy/        rules engine, YAML loading (planned)
 internal/ratelimit/     per-agent, per-tool limits (planned)
@@ -82,7 +83,7 @@ The fake server's logic lives in `internal/fakeupstream` so that `go test ./...`
 
 - Go 1.26 or newer
 
-Dependencies are tracked in `go.mod`. Week 1 uses only the standard library.
+Dependencies are tracked in `go.mod`. The only one so far is [`go.yaml.in/yaml/v4`](https://pkg.go.dev/go.yaml.in/yaml/v4) for the config file, since Go's standard library has no YAML parser. It is the YAML organization's maintained version of go-yaml. The older `gopkg.in/yaml.v3` was marked unmaintained in 2025.
 
 ## Build and test
 

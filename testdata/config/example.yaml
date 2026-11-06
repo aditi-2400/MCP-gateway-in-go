@@ -1,0 +1,9 @@
+# Example gateway config. Paths are relative to where the gateway runs.
+#
+# Each upstream is an MCP server the gateway starts as a child process and
+# talks to over stdin and stdout. Its name prefixes its tools, so the echo
+# tool of "fake" shows up as fake__echo.
+upstreams:
+  - name: fake
+    command: ./bin/fakeupstream
+    args: []
