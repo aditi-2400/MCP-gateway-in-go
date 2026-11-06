@@ -18,9 +18,10 @@ import (
 // DefaultCallTimeout is how long a forwarded request may wait for the upstream.
 const DefaultCallTimeout = 60 * time.Second
 
-// Upstream is what the proxy needs from an upstream connection.
-// upstream.Conn and upstream.Process satisfy it; tests use fakes.
-type Upstream interface {
+// Handler answers the client requests and notifications the proxy reads.
+// The gateway uses a router.Router; upstream.Conn also fits, and tests use
+// fakes.
+type Handler interface {
 	Call(ctx context.Context, method string, params json.RawMessage) (*jsonrpc.Message, error)
 	Notify(ctx context.Context, method string, params json.RawMessage) error
 }
@@ -34,9 +35,10 @@ type Options struct {
 	Logger         *slog.Logger
 }
 
-// Proxy forwards one client's messages to one upstream.
+// Proxy runs one client's session: it reads requests, passes each to the
+// Handler with a timeout, and writes the replies back with the client's IDs.
 type Proxy struct {
-	up             Upstream
+	handler        Handler
 	callTimeout    time.Duration
 	maxMessageSize int
 	logger         *slog.Logger
@@ -45,8 +47,8 @@ type Proxy struct {
 	client *jsonrpc.Writer // set while Serve runs, for upstream notifications
 }
 
-// New returns a Proxy that forwards to up.
-func New(up Upstream, opts Options) *Proxy {
+// New returns a Proxy that passes client messages to h.
+func New(h Handler, opts Options) *Proxy {
 	if opts.CallTimeout <= 0 {
 		opts.CallTimeout = DefaultCallTimeout
 	}
@@ -57,7 +59,7 @@ func New(up Upstream, opts Options) *Proxy {
 		opts.Logger = slog.New(slog.DiscardHandler)
 	}
 	return &Proxy{
-		up:             up,
+		handler:        h,
 		callTimeout:    opts.CallTimeout,
 		maxMessageSize: opts.MaxMessageSize,
 		logger:         opts.Logger,
@@ -126,7 +128,7 @@ func (p *Proxy) forward(ctx context.Context, req *jsonrpc.Message) *jsonrpc.Mess
 	callCtx, cancel := context.WithTimeout(ctx, p.callTimeout)
 	defer cancel()
 
-	resp, err := p.up.Call(callCtx, req.Method, req.Params)
+	resp, err := p.handler.Call(callCtx, req.Method, req.Params)
 	if err == nil && resp != nil {
 		// The upstream saw the gateway's own request ID; the client gets its own back.
 		if resp.Error != nil {
@@ -227,7 +229,7 @@ func (s *session) handle(msg *jsonrpc.Message) {
 			s.cancelRequest(msg.Params)
 			return
 		}
-		if err := s.p.up.Notify(s.ctx, msg.Method, msg.Params); err != nil {
+		if err := s.p.handler.Notify(s.ctx, msg.Method, msg.Params); err != nil {
 			s.p.logger.Warn("forward client notification", "method", msg.Method, "error", err)
 		}
 	default:

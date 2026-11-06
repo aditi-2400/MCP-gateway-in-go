@@ -80,7 +80,7 @@ func startProxy(t *testing.T, p *Proxy, ctx context.Context) *client {
 	return c
 }
 
-func newClient(t *testing.T, up Upstream, opts Options) (*client, *Proxy) {
+func newClient(t *testing.T, up Handler, opts Options) (*client, *Proxy) {
 	t.Helper()
 	p := New(up, opts)
 	return startProxy(t, p, context.Background()), p
