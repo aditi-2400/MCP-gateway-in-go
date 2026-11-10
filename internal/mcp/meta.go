@@ -15,6 +15,10 @@ const ProtocolVersion = "2026-07-28"
 // protocol version in a request's _meta.
 const CodeUnsupportedProtocolVersion = -32022
 
+// CodeHeaderMismatch is the error for Streamable HTTP requests whose MCP
+// headers are missing or do not match the request body.
+const CodeHeaderMismatch = -32020
+
 // RequestMeta holds the per-request fields that 2026-07-28 requires in _meta.
 type RequestMeta struct {
 	ProtocolVersion    *string         `json:"io.modelcontextprotocol/protocolVersion"`
