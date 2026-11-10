@@ -120,15 +120,20 @@ func (p *Proxy) setClient(w *jsonrpc.Writer) {
 	p.client = w
 }
 
-// forward sends one client request upstream and builds the reply for the
-// client. It returns nil when no reply should be sent, because the client
-// cancelled the request or the session is ending.
-func (p *Proxy) forward(ctx context.Context, req *jsonrpc.Message) *jsonrpc.Message {
+// Forward passes one client request to h with a timeout and builds the reply
+// for the client, with the client's own request ID. It returns nil when no
+// reply should be sent, because ctx was cancelled (the client cancelled the
+// request or went away). Failures with no answer become -32603 errors whose
+// details go to logger only. Forward never retries.
+//
+// Both the stdio session and the HTTP frontend use it, so the two transports
+// answer the same way.
+func Forward(ctx context.Context, h Handler, timeout time.Duration, req *jsonrpc.Message, logger *slog.Logger) *jsonrpc.Message {
 	id := *req.ID
-	callCtx, cancel := context.WithTimeout(ctx, p.callTimeout)
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	resp, err := p.handler.Call(callCtx, req.Method, req.Params)
+	resp, err := h.Call(callCtx, req.Method, req.Params)
 	if err == nil && resp != nil {
 		// The upstream saw the gateway's own request ID; the client gets its own back.
 		if resp.Error != nil {
@@ -144,7 +149,7 @@ func (p *Proxy) forward(ctx context.Context, req *jsonrpc.Message) *jsonrpc.Mess
 	}
 
 	// Details go to the log only, so internal paths and hosts do not leak to clients.
-	p.logger.Warn("upstream call failed", "method", req.Method, "error", err)
+	logger.Warn("upstream call failed", "method", req.Method, "error", err)
 	msg := "upstream error"
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
@@ -264,7 +269,7 @@ func (s *session) startRequest(req *jsonrpc.Message) {
 		defer s.wg.Done()
 		defer cancel()
 		defer s.untrack(id)
-		if resp := s.p.forward(ctx, req); resp != nil {
+		if resp := Forward(ctx, s.p.handler, s.p.callTimeout, req, s.p.logger); resp != nil {
 			s.write(resp)
 		}
 	}()
