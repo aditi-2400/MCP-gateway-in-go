@@ -19,9 +19,22 @@ const maxNameLength = 32
 // not allowed, so the "__" separator can never be ambiguous.
 var namePattern = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
 
+// keyHashPattern is a SHA-256 in lowercase hex, as `gateway keygen` prints.
+var keyHashPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
 // Config is the whole config file.
 type Config struct {
 	Upstreams []Upstream `yaml:"upstreams"`
+	// Agents are the callers allowed to use the gateway. At least one is
+	// required: with no agents, nobody could authenticate.
+	Agents []Agent `yaml:"agents"`
+}
+
+// Agent is one caller, identified by an API key. Only the key's SHA-256 is
+// stored, so the config file never holds a usable secret.
+type Agent struct {
+	Name      string `yaml:"name"`
+	KeySHA256 string `yaml:"key_sha256"`
 }
 
 // Upstream is one MCP server the gateway starts and connects to over stdio.
@@ -62,6 +75,10 @@ func parse(data []byte) (*Config, error) {
 // validate reports every problem at once, so the whole file can be fixed in
 // one pass.
 func (c *Config) validate() error {
+	return errors.Join(c.validateUpstreams(), c.validateAgents())
+}
+
+func (c *Config) validateUpstreams() error {
 	if len(c.Upstreams) == 0 {
 		return errors.New("no upstreams configured")
 	}
@@ -82,6 +99,55 @@ func (c *Config) validate() error {
 		firstUse[up.Name] = i
 	}
 	return errors.Join(errs...)
+}
+
+func (c *Config) validateAgents() error {
+	if len(c.Agents) == 0 {
+		return errors.New("no agents configured; add one with `gateway keygen -agent NAME`")
+	}
+
+	var errs []error
+	nameUse := make(map[string]int)
+	keyUse := make(map[string]int)
+	for i, a := range c.Agents {
+		for _, err := range a.validate() {
+			errs = append(errs, fmt.Errorf("agents[%d]: %w", i, err))
+		}
+		if j, ok := nameUse[a.Name]; ok && a.Name != "" {
+			errs = append(errs, fmt.Errorf("agents[%d]: name %q is already used by agents[%d]", i, a.Name, j))
+		} else {
+			nameUse[a.Name] = i
+		}
+		if j, ok := keyUse[a.KeySHA256]; ok && a.KeySHA256 != "" {
+			errs = append(errs, fmt.Errorf("agents[%d]: key_sha256 is the same as agents[%d]; each agent needs its own key", i, j))
+		} else {
+			keyUse[a.KeySHA256] = i
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// validate never puts key_sha256 in an error, in case someone pasted a raw
+// key there and the error ends up in a log.
+func (a Agent) validate() []error {
+	var errs []error
+	switch {
+	case a.Name == "":
+		errs = append(errs, errors.New("name is required"))
+	case len(a.Name) > maxNameLength:
+		errs = append(errs, fmt.Errorf("name %q must be at most %d characters", a.Name, maxNameLength))
+	case !namePattern.MatchString(a.Name):
+		errs = append(errs, fmt.Errorf("name %q must start with a lowercase letter and use only lowercase letters, digits, and '-'", a.Name))
+	}
+	switch {
+	case a.KeySHA256 == "":
+		errs = append(errs, errors.New("key_sha256 is required"))
+	case strings.HasPrefix(a.KeySHA256, "mcpgw_"):
+		errs = append(errs, errors.New("key_sha256 holds a raw API key; store only its hash (see `gateway keygen`), and replace that key since it is now in a file"))
+	case !keyHashPattern.MatchString(a.KeySHA256):
+		errs = append(errs, errors.New("key_sha256 must be 64 lowercase hex characters (see `gateway keygen`)"))
+	}
+	return errs
 }
 
 func (u Upstream) validate() []error {

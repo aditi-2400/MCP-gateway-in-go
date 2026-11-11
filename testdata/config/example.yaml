@@ -7,3 +7,10 @@ upstreams:
   - name: fake
     command: ./bin/fakeupstream
     args: []
+
+# Agents are the callers allowed in. Only the SHA-256 of each API key is
+# stored here. This hash belongs to a key nobody has; make your own with
+# `gateway keygen -agent NAME` and replace it.
+agents:
+  - name: example
+    key_sha256: 0000000000000000000000000000000000000000000000000000000000000000

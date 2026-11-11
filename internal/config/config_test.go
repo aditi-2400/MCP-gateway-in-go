@@ -8,6 +8,14 @@ import (
 	"testing"
 )
 
+// testHash is a well-formed key_sha256 (the SHA-256 of "abc").
+const testHash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+
+// withAgent adds the agents section every valid config needs.
+func withAgent(yaml string) string {
+	return yaml + "agents:\n  - name: tester\n    key_sha256: " + testHash + "\n"
+}
+
 func TestParseValid(t *testing.T) {
 	tests := []struct {
 		name string
@@ -50,7 +58,7 @@ upstreams:
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg, err := parse([]byte(tt.yaml))
+			cfg, err := parse([]byte(withAgent(tt.yaml)))
 			if err != nil {
 				t.Fatalf("parse() error = %v", err)
 			}
@@ -146,5 +154,61 @@ func TestLoadErrorsNameTheFile(t *testing.T) {
 				t.Fatalf("Load() error = %v, want it to name %s", err, tt.path)
 			}
 		})
+	}
+}
+
+func TestParseAgents(t *testing.T) {
+	const upstream = "upstreams:\n  - name: fs\n    command: x\n"
+	otherHash := strings.Repeat("0", 64)
+	tests := []struct {
+		name    string
+		agents  string
+		wantErr []string // nil means valid
+	}{
+		{name: "one agent", agents: "agents:\n  - name: ci-bot\n    key_sha256: " + testHash + "\n"},
+		{name: "two agents", agents: "agents:\n  - name: a\n    key_sha256: " + testHash + "\n  - name: b\n    key_sha256: " + otherHash + "\n"},
+		{name: "no agents section", agents: "", wantErr: []string{"no agents configured"}},
+		{name: "empty agents list", agents: "agents: []\n", wantErr: []string{"no agents configured"}},
+		{name: "missing name", agents: "agents:\n  - key_sha256: " + testHash + "\n", wantErr: []string{"agents[0]", "name is required"}},
+		{name: "bad name", agents: "agents:\n  - name: CI_Bot\n    key_sha256: " + testHash + "\n", wantErr: []string{`"CI_Bot"`}},
+		{name: "missing hash", agents: "agents:\n  - name: a\n", wantErr: []string{"key_sha256 is required"}},
+		{name: "short hash", agents: "agents:\n  - name: a\n    key_sha256: " + testHash[:63] + "\n", wantErr: []string{"64 lowercase hex"}},
+		{name: "uppercase hash", agents: "agents:\n  - name: a\n    key_sha256: " + strings.ToUpper(testHash) + "\n", wantErr: []string{"64 lowercase hex"}},
+		{name: "typo in field", agents: "agents:\n  - name: a\n    key_sha265: " + testHash + "\n", wantErr: []string{"parse", "key_sha265"}},
+		{name: "duplicate name", agents: "agents:\n  - name: a\n    key_sha256: " + testHash + "\n  - name: a\n    key_sha256: " + otherHash + "\n", wantErr: []string{"agents[1]", `"a"`, "agents[0]"}},
+		{name: "same key twice", agents: "agents:\n  - name: a\n    key_sha256: " + testHash + "\n  - name: b\n    key_sha256: " + testHash + "\n", wantErr: []string{"agents[1]", "same as agents[0]"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := parse([]byte(upstream + tt.agents))
+			if tt.wantErr == nil {
+				if err != nil {
+					t.Fatalf("parse() error = %v", err)
+				}
+				if len(cfg.Agents) == 0 {
+					t.Fatal("no agents parsed")
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("parse() error = nil, want an error")
+			}
+			for _, want := range tt.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestRawKeyInConfigIsRejectedWithoutEchoingIt(t *testing.T) {
+	const rawKey = "mcpgw_ThisIsWhatARealKeyLooksLikeAAAAAAAAAAAAAAA"
+	_, err := parse([]byte("upstreams:\n  - name: fs\n    command: x\nagents:\n  - name: a\n    key_sha256: " + rawKey + "\n"))
+	if err == nil || !strings.Contains(err.Error(), "raw API key") {
+		t.Fatalf("parse() error = %v, want a raw key warning", err)
+	}
+	if strings.Contains(err.Error(), rawKey) {
+		t.Fatalf("error %q echoes the key", err)
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/auth"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
 )
 
@@ -27,6 +28,9 @@ const validMeta = `"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-2
 // Binaries built once in TestMain: the fake MCP server, and the gateway
 // itself for the end-to-end tests.
 var fakeUpstreamBin, gatewayBin string
+
+// testAPIKey belongs to the "tester" agent in every config writeConfig makes.
+var testAPIKey string
 
 func TestMain(m *testing.M) {
 	os.Exit(runTests(m))
@@ -39,6 +43,11 @@ func runTests(m *testing.M) int {
 		return 1
 	}
 	defer os.RemoveAll(dir)
+
+	if testAPIKey, err = auth.GenerateKey(); err != nil {
+		fmt.Fprintln(os.Stderr, "generate test key:", err)
+		return 1
+	}
 
 	fakeUpstreamBin = filepath.Join(dir, "fakeupstream")
 	gatewayBin = filepath.Join(dir, "gateway")
@@ -178,6 +187,7 @@ func writeConfig(t *testing.T, upstreams ...upstreamEntry) string {
 		}
 		fmt.Fprintf(&b, "  - name: %s\n    command: %q\n    args: %s\n", u.name, u.command, args)
 	}
+	fmt.Fprintf(&b, "agents:\n  - name: tester\n    key_sha256: %s\n", auth.HashKey(testAPIKey))
 	path := filepath.Join(t.TempDir(), "gateway.yaml")
 	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
 		t.Fatal(err)

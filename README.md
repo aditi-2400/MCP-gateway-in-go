@@ -122,7 +122,13 @@ upstreams:
   - name: fs                      # tools show up as fs__<tool>
     command: /usr/local/bin/fs-server
     args: ["--root", "/tmp/agent-workspace"]
+
+agents:
+  - name: ci-bot                  # who is calling; used by policy later
+    key_sha256: <SHA-256 of the agent's API key, 64 lowercase hex characters>
 ```
+
+At least one agent is required. The file holds only the SHA-256 of each API key, never the key itself; a config with a raw `mcpgw_...` key in it is rejected. (Keys aren't checked on requests yet; that comes next.)
 
 Commands run directly, not through a shell. Only the command is logged, since arguments can hold tokens. Exit codes: 0 for a normal stop, 1 if the config is bad or an upstream fails or exits, 2 for a bad command line.
 
