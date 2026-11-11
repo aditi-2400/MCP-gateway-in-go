@@ -5,8 +5,11 @@
 // Usage:
 //
 //	gateway -config gateway.yaml [-call-timeout 60s] [-log-level info]
+//	gateway -config gateway.yaml -http 127.0.0.1:8080 [-allow-origin URL]...
 //
-// Logs go to stderr, because stdout carries MCP messages.
+// Without -http it speaks MCP over stdin and stdout, and logs go to stderr
+// because stdout carries MCP messages. With -http it serves Streamable HTTP
+// at /mcp and does not read stdin.
 package main
 
 import (
@@ -18,12 +21,14 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/config"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/progress"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/proxy"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/router"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/upstream"
@@ -54,9 +59,21 @@ func main() {
 }
 
 type flags struct {
-	configPath  string
-	callTimeout time.Duration
-	logLevel    slog.Level
+	configPath     string
+	callTimeout    time.Duration
+	logLevel       slog.Level
+	httpAddr       string // empty means stdio
+	allowedOrigins stringList
+}
+
+// stringList is a flag that can be given more than once.
+type stringList []string
+
+func (l *stringList) String() string { return strings.Join(*l, ",") }
+
+func (l *stringList) Set(v string) error {
+	*l = append(*l, v)
+	return nil
 }
 
 func parseFlags(args []string, stderr io.Writer) (flags, error) {
@@ -71,6 +88,8 @@ func parseFlags(args []string, stderr io.Writer) (flags, error) {
 	fs.StringVar(&f.configPath, "config", "", "path to the YAML config file listing upstream servers (required)")
 	fs.DurationVar(&f.callTimeout, "call-timeout", proxy.DefaultCallTimeout, "how long each request may wait for the upstreams")
 	fs.TextVar(&f.logLevel, "log-level", f.logLevel, "log level: debug, info, warn, or error")
+	fs.StringVar(&f.httpAddr, "http", "", "serve Streamable HTTP on this loopback address (e.g. 127.0.0.1:8080) in place of stdio")
+	fs.Var(&f.allowedOrigins, "allow-origin", "browser Origin allowed to call the HTTP endpoint (repeatable)")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -86,6 +105,14 @@ func parseFlags(args []string, stderr io.Writer) (flags, error) {
 	}
 	if f.callTimeout <= 0 {
 		return flags{}, usageFailure(fs, "-call-timeout must be positive")
+	}
+	if f.httpAddr == "" && len(f.allowedOrigins) > 0 {
+		return flags{}, usageFailure(fs, "-allow-origin needs -http")
+	}
+	if f.httpAddr != "" {
+		if err := checkLoopback(f.httpAddr); err != nil {
+			return flags{}, usageFailure(fs, err.Error())
+		}
 	}
 	return f, nil
 }
@@ -114,8 +141,14 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	// Upstream read loops start inside StartGroup, but the proxy can only be
 	// built after it. Notifications that arrive before the proxy exists are
 	// dropped, the same as when no client is connected.
+	// Progress goes back to the request that asked for it. Other upstream
+	// notifications go to the stdio client, if there is one.
+	tracker := progress.NewTracker()
 	var prx atomic.Pointer[proxy.Proxy]
 	forward := func(msg *jsonrpc.Message) {
+		if tracker.Deliver(msg) {
+			return
+		}
 		if p := prx.Load(); p != nil {
 			p.ForwardNotification(msg)
 			return
@@ -143,10 +176,16 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	p := proxy.New(rt, proxy.Options{
 		CallTimeout: f.callTimeout,
 		Logger:      logger.With("component", "proxy"),
+		Progress:    tracker,
 	})
 	prx.Store(p)
 
-	serveErr := serve(ctx, p, group, stdin, stdout)
+	var serveErr error
+	if f.httpAddr != "" {
+		serveErr = serveHTTP(ctx, rt, tracker, group, f, logger)
+	} else {
+		serveErr = serve(ctx, p, group, stdin, stdout)
+	}
 	if ctx.Err() != nil {
 		// Ctrl+C or SIGTERM is a normal way to stop.
 		logger.Info("shutting down on signal")

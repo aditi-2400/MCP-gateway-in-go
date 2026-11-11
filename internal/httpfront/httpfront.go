@@ -4,9 +4,11 @@
 package httpfront
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"mime"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/mcp"
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/progress"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/proxy"
 )
 
@@ -33,6 +36,18 @@ type Options struct {
 	// MaxMessageSize limits each request body.
 	MaxMessageSize int
 	Logger         *slog.Logger
+	// Progress routes upstream progress notifications back to the request
+	// that asked for them, over an SSE stream. If nil, replies are always
+	// plain JSON.
+	Progress *progress.Tracker
+	// Schemas provides tool input schemas, used to check Mcp-Param-*
+	// headers on tools/call. If nil, those headers are not checked.
+	Schemas SchemaSource
+}
+
+// SchemaSource looks up a tool's inputSchema. router.Router implements it.
+type SchemaSource interface {
+	ToolSchema(ctx context.Context, tool string, meta json.RawMessage) (schema json.RawMessage, found bool, err error)
 }
 
 type frontend struct {
@@ -41,6 +56,8 @@ type frontend struct {
 	callTimeout    time.Duration
 	maxMessageSize int
 	logger         *slog.Logger
+	progress       *progress.Tracker
+	schemas        SchemaSource
 }
 
 // New returns an http.Handler that serves MCP at Path and passes each
@@ -61,6 +78,8 @@ func New(h proxy.Handler, opts Options) http.Handler {
 		callTimeout:    opts.CallTimeout,
 		maxMessageSize: opts.MaxMessageSize,
 		logger:         opts.Logger,
+		progress:       opts.Progress,
+		schemas:        opts.Schemas,
 	}
 	for _, origin := range opts.AllowedOrigins {
 		f.allowedOrigins[origin] = true
@@ -132,13 +151,88 @@ func (f *frontend) serveRequest(w http.ResponseWriter, r *http.Request, req *jso
 		f.writeMessage(w, http.StatusBadRequest, jsonrpc.NewErrorResponse(req.ID, rpcErr))
 		return
 	}
+	if req.Method == "tools/call" && f.schemas != nil {
+		if status, rpcErr := f.checkToolParams(r.Context(), r.Header, req); rpcErr != nil {
+			f.writeMessage(w, status, jsonrpc.NewErrorResponse(req.ID, rpcErr))
+			return
+		}
+	}
+	// The SSE stream only starts if progress actually arrives. Until then the
+	// reply can still be plain JSON with the status code its error calls for.
+	sse := &sseWriter{w: w, logger: f.logger}
 	// r.Context() is cancelled when the client disconnects, which is how
 	// Streamable HTTP cancels a request.
-	resp := proxy.Forward(r.Context(), f.handler, f.callTimeout, req, f.logger)
-	if resp == nil {
-		return // the client is gone
+	proxy.ForwardWithProgress(r.Context(), f.handler, f.callTimeout, req, f.logger, f.progress, sse.event, func(resp *jsonrpc.Message) {
+		switch {
+		case resp == nil:
+			// The client is gone.
+		case sse.started:
+			sse.event(resp)
+		default:
+			f.writeMessage(w, statusFor(resp.Error), resp)
+		}
+	})
+}
+
+// checkToolParams checks Mcp-Param-* headers against the call's arguments,
+// using the tool's schema. It fails closed: if the schema cannot be fetched or
+// the tool definition is invalid, the call is rejected, since the headers
+// cannot be shown to match.
+func (f *frontend) checkToolParams(ctx context.Context, h http.Header, req *jsonrpc.Message) (int, *jsonrpc.Error) {
+	var params struct {
+		Name string          `json:"name"`
+		Meta json.RawMessage `json:"_meta"`
 	}
-	f.writeMessage(w, statusFor(resp.Error), resp)
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return 0, nil // the router rejects malformed params with its own error
+	}
+	schema, found, err := f.schemas.ToolSchema(ctx, params.Name, params.Meta)
+	if err != nil {
+		f.logger.Warn("tool schema lookup failed", "tool", params.Name, "error", err)
+		return http.StatusOK, &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: "could not check Mcp-Param headers"}
+	}
+	if !found {
+		return 0, nil // the router or upstream answers "Unknown tool"
+	}
+	if err := checkParamHeaders(h, schema, req.Params); err != nil {
+		f.logger.Debug("Mcp-Param header check failed", "tool", params.Name, "error", err)
+		return http.StatusBadRequest, mismatch(err.Error())
+	}
+	return 0, nil
+}
+
+// sseWriter writes messages as Server-Sent Events. It is only used through a
+// progress.Stream, which keeps calls from overlapping.
+type sseWriter struct {
+	w       http.ResponseWriter
+	logger  *slog.Logger
+	started bool
+}
+
+func (s *sseWriter) event(msg *jsonrpc.Message) {
+	if !s.started {
+		h := s.w.Header()
+		h.Set("Content-Type", "text/event-stream")
+		h.Set("Cache-Control", "no-cache")
+		// Tells proxies like nginx not to hold events back (spec SHOULD).
+		h.Set("X-Accel-Buffering", "no")
+		s.w.WriteHeader(http.StatusOK)
+		s.started = true
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		s.logger.Error("encode SSE event", "error", err)
+		return
+	}
+	// One JSON message per event. Marshal output has no newlines, so it fits
+	// on one data line.
+	if _, err := fmt.Fprintf(s.w, "event: message\ndata: %s\n\n", data); err != nil {
+		s.logger.Debug("write SSE event", "error", err)
+		return
+	}
+	if err := http.NewResponseController(s.w).Flush(); err != nil {
+		s.logger.Debug("flush SSE event", "error", err)
+	}
 }
 
 // statusFor picks the HTTP status the spec asks for. Other errors, such as

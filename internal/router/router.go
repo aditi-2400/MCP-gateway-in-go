@@ -15,6 +15,7 @@ import (
 
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/mcp"
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/progress"
 )
 
 // Separator joins an upstream name and a tool name: fs__read_file.
@@ -54,6 +55,11 @@ type Router struct {
 	byName    map[string]Upstream
 	maxPages  int
 	logger    *slog.Logger
+
+	// schemas caches each tool's inputSchema from the last successful
+	// tools/list of its upstream: upstream name -> prefixed tool -> schema.
+	schemaMu sync.Mutex
+	schemas  map[string]map[string]json.RawMessage
 }
 
 // New returns a Router over upstreams. Names must be non-empty, unique, and
@@ -89,6 +95,7 @@ func New(upstreams []Named, opts Options) (*Router, error) {
 		byName:    byName,
 		maxPages:  opts.MaxPages,
 		logger:    opts.Logger,
+		schemas:   make(map[string]map[string]json.RawMessage),
 	}, nil
 }
 
@@ -166,6 +173,10 @@ func (r *Router) listTools(ctx context.Context, params json.RawMessage) (*jsonrp
 		return errorMessage(&jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: "invalid cursor"}), nil
 	}
 
+	// Progress from several upstreams would not add up to one increasing
+	// count, so a fanned-out list reports none.
+	meta := progress.Strip(p.Meta)
+
 	type fetched struct {
 		tools []json.RawMessage
 		err   error
@@ -174,7 +185,7 @@ func (r *Router) listTools(ctx context.Context, params json.RawMessage) (*jsonrp
 	var wg sync.WaitGroup
 	for i, u := range r.upstreams {
 		wg.Go(func() {
-			results[i].tools, results[i].err = r.fetchTools(ctx, u.Upstream, p.Meta)
+			results[i].tools, results[i].err = r.fetchTools(ctx, u.Upstream, meta)
 		})
 	}
 	wg.Wait()
@@ -194,7 +205,9 @@ func (r *Router) listTools(ctx context.Context, params json.RawMessage) (*jsonrp
 			continue
 		}
 		answered++
-		merged = append(merged, r.prefixTools(name, res.tools)...)
+		tools, schemas := r.prefixTools(name, res.tools)
+		r.storeSchemas(name, schemas)
+		merged = append(merged, tools...)
 	}
 	if answered == 0 {
 		return errorMessage(&jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: "no upstream answered tools/list"}), nil
@@ -248,47 +261,86 @@ func (r *Router) fetchTools(ctx context.Context, up Upstream, meta json.RawMessa
 
 // prefixTools renames each tool to prefix__name and leaves every other field
 // untouched. A malformed tool is skipped so it cannot hide the others, and a
-// repeated name keeps only the first tool.
-func (r *Router) prefixTools(prefix string, tools []json.RawMessage) []json.RawMessage {
+// repeated name keeps only the first tool. It also returns each kept tool's
+// inputSchema by prefixed name.
+func (r *Router) prefixTools(prefix string, tools []json.RawMessage) ([]json.RawMessage, map[string]json.RawMessage) {
 	out := make([]json.RawMessage, 0, len(tools))
-	seen := make(map[string]bool, len(tools))
+	schemas := make(map[string]json.RawMessage, len(tools))
 	for i, raw := range tools {
-		name, tool, err := prefixTool(prefix, raw)
+		name, tool, schema, err := prefixTool(prefix, raw)
 		if err != nil {
 			r.logger.Warn("skipping malformed tool", "upstream", prefix, "index", i, "error", err)
 			continue
 		}
-		if seen[name] {
+		if _, seen := schemas[name]; seen {
 			r.logger.Warn("skipping duplicate tool", "upstream", prefix, "tool", name)
 			continue
 		}
-		seen[name] = true
+		schemas[name] = schema
 		out = append(out, tool)
 	}
-	return out
+	return out, schemas
 }
 
-func prefixTool(prefix string, raw json.RawMessage) (string, json.RawMessage, error) {
+func prefixTool(prefix string, raw json.RawMessage) (name string, tool, schema json.RawMessage, err error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
-		return "", nil, errors.New("tool is not a JSON object")
+		return "", nil, nil, errors.New("tool is not a JSON object")
 	}
-	var name string
-	if err := json.Unmarshal(fields["name"], &name); err != nil || name == "" {
-		return "", nil, errors.New("tool has no name")
+	var original string
+	if err := json.Unmarshal(fields["name"], &original); err != nil || original == "" {
+		return "", nil, nil, errors.New("tool has no name")
 	}
 
-	full := prefix + Separator + name
-	encodedName, err := json.Marshal(full)
+	name = prefix + Separator + original
+	encodedName, err := json.Marshal(name)
 	if err != nil {
-		return "", nil, fmt.Errorf("encode tool name: %w", err)
+		return "", nil, nil, fmt.Errorf("encode tool name: %w", err)
 	}
 	fields["name"] = encodedName
-	tool, err := json.Marshal(fields)
-	if err != nil {
-		return "", nil, fmt.Errorf("encode tool: %w", err)
+	if tool, err = json.Marshal(fields); err != nil {
+		return "", nil, nil, fmt.Errorf("encode tool: %w", err)
 	}
-	return full, tool, nil
+	return name, tool, fields["inputSchema"], nil
+}
+
+func (r *Router) storeSchemas(upstreamName string, schemas map[string]json.RawMessage) {
+	r.schemaMu.Lock()
+	defer r.schemaMu.Unlock()
+	r.schemas[upstreamName] = schemas
+}
+
+func (r *Router) cachedSchema(upstreamName, tool string) (json.RawMessage, bool) {
+	r.schemaMu.Lock()
+	defer r.schemaMu.Unlock()
+	schema, ok := r.schemas[upstreamName][tool]
+	return schema, ok
+}
+
+// ToolSchema returns the inputSchema of a prefixed tool such as fs__read_file.
+// It uses the schemas from the last tools/list, and lists that one upstream
+// again if the tool is not known yet (for example, a client calling without
+// listing first, or a tool added since). meta is the caller's _meta, needed
+// for the upstream request. found is false for an unknown upstream or a tool
+// the upstream does not have.
+func (r *Router) ToolSchema(ctx context.Context, tool string, meta json.RawMessage) (schema json.RawMessage, found bool, err error) {
+	prefix, _, ok := strings.Cut(tool, Separator)
+	up, known := r.byName[prefix]
+	if !ok || !known {
+		return nil, false, nil
+	}
+	if schema, ok := r.cachedSchema(prefix, tool); ok {
+		return schema, true, nil
+	}
+
+	raw, err := r.fetchTools(ctx, up, progress.Strip(meta))
+	if err != nil {
+		return nil, false, fmt.Errorf("router: list %s for tool schema: %w", prefix, err)
+	}
+	_, schemas := r.prefixTools(prefix, raw)
+	r.storeSchemas(prefix, schemas)
+	schema, found = schemas[tool]
+	return schema, found, nil
 }
 
 // callTool sends a tools/call to the upstream named by the tool's prefix,

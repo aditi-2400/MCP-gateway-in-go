@@ -8,6 +8,7 @@ import (
 	"io"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -292,3 +293,23 @@ func wantError(t *testing.T, resp *jsonrpc.Message, id *jsonrpc.ID, code int) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+func TestBinaryStdioProgress(t *testing.T) {
+	g := startGatewayProcess(t, "-config", fakeConfig(t, "alpha"))
+	g.send(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"alpha__count","arguments":{"n":3},` +
+		`"_meta":{"progressToken":"mine","io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`)
+
+	for i := 1; i <= 3; i++ {
+		msg := g.next()
+		want := `"progress":` + strconv.Itoa(i)
+		if msg.Method != "notifications/progress" || !strings.Contains(string(msg.Params), `"progressToken":"mine"`) || !strings.Contains(string(msg.Params), want) {
+			t.Fatalf("message %d = %s %s, want progress %d with the client's token", i, msg.Method, msg.Params, i)
+		}
+	}
+	wantResult(t, g.next(), jsonrpc.NewIntID(1), "counted to 3")
+
+	g.stdin.Close()
+	if code := g.exitCode(); code != 0 {
+		t.Fatalf("exit code = %d\nstderr:\n%s", code, g.stderr)
+	}
+}

@@ -317,6 +317,8 @@ func TestParseFlags(t *testing.T) {
 		wantErr     error
 		wantConfig  string
 		wantTimeout time.Duration
+		wantHTTP    string
+		wantOrigins string
 	}{
 		{name: "config only", args: []string{"-config", "g.yaml"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second},
 		{name: "config with equals", args: []string{"-config=g.yaml"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second},
@@ -332,6 +334,18 @@ func TestParseFlags(t *testing.T) {
 		{name: "bad log level", args: []string{"-config", "g.yaml", "-log-level", "loud"}, wantErr: errUsage},
 		{name: "unknown flag", args: []string{"-nope", "-config", "g.yaml"}, wantErr: errUsage},
 		{name: "help", args: []string{"-h"}, wantErr: flag.ErrHelp},
+		{name: "http on 127.0.0.1", args: []string{"-config", "g.yaml", "-http", "127.0.0.1:8080"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "127.0.0.1:8080"},
+		{name: "http on ::1", args: []string{"-config", "g.yaml", "-http", "[::1]:0"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "[::1]:0"},
+		{name: "http on localhost", args: []string{"-config", "g.yaml", "-http", "localhost:0"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "localhost:0"},
+		{name: "http on 127.0.0.2", args: []string{"-config", "g.yaml", "-http", "127.0.0.2:80"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "127.0.0.2:80"},
+		{name: "origins with http", args: []string{"-config", "g.yaml", "-http", "127.0.0.1:0", "-allow-origin", "http://a", "-allow-origin", "http://b"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "127.0.0.1:0", wantOrigins: "http://a,http://b"},
+		{name: "http on all interfaces", args: []string{"-config", "g.yaml", "-http", ":8080"}, wantErr: errUsage},
+		{name: "http on 0.0.0.0", args: []string{"-config", "g.yaml", "-http", "0.0.0.0:8080"}, wantErr: errUsage},
+		{name: "http on [::]", args: []string{"-config", "g.yaml", "-http", "[::]:8080"}, wantErr: errUsage},
+		{name: "http on a LAN address", args: []string{"-config", "g.yaml", "-http", "192.168.1.10:8080"}, wantErr: errUsage},
+		{name: "http on a hostname", args: []string{"-config", "g.yaml", "-http", "example.com:8080"}, wantErr: errUsage},
+		{name: "http without port", args: []string{"-config", "g.yaml", "-http", "127.0.0.1"}, wantErr: errUsage},
+		{name: "origins without http", args: []string{"-config", "g.yaml", "-allow-origin", "http://a"}, wantErr: errUsage},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -350,6 +364,9 @@ func TestParseFlags(t *testing.T) {
 			}
 			if f.callTimeout != tt.wantTimeout {
 				t.Errorf("callTimeout = %v, want %v", f.callTimeout, tt.wantTimeout)
+			}
+			if f.httpAddr != tt.wantHTTP || f.allowedOrigins.String() != tt.wantOrigins {
+				t.Errorf("http = %q origins = %q, want %q and %q", f.httpAddr, f.allowedOrigins.String(), tt.wantHTTP, tt.wantOrigins)
 			}
 		})
 	}

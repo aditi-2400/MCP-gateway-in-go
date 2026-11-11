@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/progress"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/upstream"
 )
 
@@ -33,6 +34,9 @@ type Options struct {
 	// MaxMessageSize limits each message read from the client.
 	MaxMessageSize int
 	Logger         *slog.Logger
+	// Progress routes upstream progress notifications back to the request
+	// that asked for them. If nil, progress tokens are passed through as is.
+	Progress *progress.Tracker
 }
 
 // Proxy runs one client's session: it reads requests, passes each to the
@@ -42,6 +46,7 @@ type Proxy struct {
 	callTimeout    time.Duration
 	maxMessageSize int
 	logger         *slog.Logger
+	progress       *progress.Tracker
 
 	mu     sync.Mutex
 	client *jsonrpc.Writer // set while Serve runs, for upstream notifications
@@ -63,6 +68,7 @@ func New(h Handler, opts Options) *Proxy {
 		callTimeout:    opts.CallTimeout,
 		maxMessageSize: opts.MaxMessageSize,
 		logger:         opts.Logger,
+		progress:       opts.Progress,
 	}
 }
 
@@ -158,6 +164,27 @@ func Forward(ctx context.Context, h Handler, timeout time.Duration, req *jsonrpc
 		msg = "upstream unavailable"
 	}
 	return jsonrpc.NewErrorResponse(&id, &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: msg})
+}
+
+// ForwardWithProgress is Forward plus progress routing. If req has a
+// _meta.progressToken and tracker is set, the upstream gets a gateway token,
+// and progress for it goes to notify until the reply is ready. reply is then
+// called exactly once, with Forward's result (nil means send nothing), and no
+// progress can follow it.
+func ForwardWithProgress(ctx context.Context, h Handler, timeout time.Duration, req *jsonrpc.Message, logger *slog.Logger,
+	tracker *progress.Tracker, notify, reply func(*jsonrpc.Message)) {
+	if tracker == nil {
+		reply(Forward(ctx, h, timeout, req, logger))
+		return
+	}
+	stream := progress.NewStream(notify)
+	params, release, _ := tracker.Track(req.Params, stream.Send)
+	forwarded := *req
+	forwarded.Params = params
+
+	resp := Forward(ctx, h, timeout, &forwarded, logger)
+	release()
+	stream.Finish(func() { reply(resp) })
 }
 
 // session is the state of one Serve call.
@@ -269,9 +296,11 @@ func (s *session) startRequest(req *jsonrpc.Message) {
 		defer s.wg.Done()
 		defer cancel()
 		defer s.untrack(id)
-		if resp := Forward(ctx, s.p.handler, s.p.callTimeout, req, s.p.logger); resp != nil {
-			s.write(resp)
-		}
+		ForwardWithProgress(ctx, s.p.handler, s.p.callTimeout, req, s.p.logger, s.p.progress, s.write, func(resp *jsonrpc.Message) {
+			if resp != nil {
+				s.write(resp)
+			}
+		})
 	}()
 }
 

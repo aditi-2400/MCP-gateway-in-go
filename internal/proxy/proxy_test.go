@@ -11,6 +11,7 @@ import (
 
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/fakeupstream"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/progress"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/upstream"
 )
 
@@ -464,3 +465,37 @@ func TestEndToEndWithFakeUpstream(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+func TestProgressReachesClientWithItsOwnToken(t *testing.T) {
+	tracker := progress.NewTracker()
+	seenToken := make(chan string, 1)
+	up := &fakeUpstream{call: func(_ context.Context, _ string, params json.RawMessage) (*jsonrpc.Message, error) {
+		var p struct {
+			Meta struct {
+				ProgressToken json.RawMessage `json:"progressToken"`
+			} `json:"_meta"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		seenToken <- string(p.Meta.ProgressToken)
+		// What the upstream read loop would do with the upstream's notification.
+		tracker.Deliver(jsonrpc.NewNotification("notifications/progress",
+			json.RawMessage(`{"progressToken":`+string(p.Meta.ProgressToken)+`,"progress":1,"total":2}`)))
+		return jsonrpc.NewResult(jsonrpc.NewIntID(1), json.RawMessage(`{"done":true}`)), nil
+	}}
+	c, _ := newClient(t, up, Options{Progress: tracker})
+
+	c.send(`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"x","_meta":{"progressToken":"mine"}}}`)
+
+	if token := wait(t, seenToken, "upstream call"); token == `"mine"` {
+		t.Errorf("upstream saw the client's token %s, want a gateway token", token)
+	}
+	first := c.next()
+	if first.Method != "notifications/progress" || !strings.Contains(string(first.Params), `"progressToken":"mine"`) {
+		t.Fatalf("first message = %s %s, want progress with the client's token", first.Method, first.Params)
+	}
+	if second := c.next(); second.ID == nil || *second.ID != jsonrpc.NewIntID(5) || string(second.Result) != `{"done":true}` {
+		t.Fatalf("second message = %+v, want the result for id 5", second)
+	}
+}

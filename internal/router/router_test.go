@@ -236,6 +236,18 @@ func TestToolsListForwardsClientMeta(t *testing.T) {
 	}
 }
 
+func TestToolsListDoesNotForwardProgressToken(t *testing.T) {
+	up := listing(`{"name":"echo"}`)
+	r := newRouter(t, Named{Name: "fs", Upstream: up})
+	params := json.RawMessage(`{"_meta":{"progressToken":"p1","io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}`)
+	if resp := call(t, r, "tools/list", params); resp.Error != nil {
+		t.Fatalf("tools/list error = %v", resp.Error)
+	}
+	if calls := up.callLog(); len(calls) != 1 || strings.Contains(calls[0], "progressToken") {
+		t.Fatalf("upstream calls = %v, want one without progressToken", calls)
+	}
+}
+
 func TestToolsListFollowsPages(t *testing.T) {
 	// Three pages. The second cursor is an empty string, which the spec says
 	// is a real cursor, not the end.
@@ -552,5 +564,63 @@ func TestNotificationsFromClientAreDropped(t *testing.T) {
 	}
 	if calls := up.callLog(); len(calls) != 0 {
 		t.Errorf("upstream got calls %v, want none", calls)
+	}
+}
+
+func TestToolSchemaUsesTheLastList(t *testing.T) {
+	fs := listing(`{"name":"read","inputSchema":{"type":"object","x":1}}`)
+	gh := listing(`{"name":"search","inputSchema":{"type":"object","y":2}}`)
+	r := newRouter(t, Named{Name: "fs", Upstream: fs}, Named{Name: "github", Upstream: gh})
+	toolNames(t, r)
+
+	schema, found, err := r.ToolSchema(context.Background(), "github__search", json.RawMessage(validMeta))
+	if err != nil || !found || string(schema) != `{"type":"object","y":2}` {
+		t.Fatalf("ToolSchema() = %s, %v, %v, want the cached schema", schema, found, err)
+	}
+	if n := len(gh.callLog()); n != 1 {
+		t.Errorf("github got %d calls, want only the one tools/list", n)
+	}
+}
+
+func TestToolSchemaListsOneUpstreamOnAMiss(t *testing.T) {
+	fs := listing(`{"name":"read","inputSchema":{"type":"object"}}`)
+	gh := listing(`{"name":"search","inputSchema":{"type":"object","y":2}}`)
+	r := newRouter(t, Named{Name: "fs", Upstream: fs}, Named{Name: "github", Upstream: gh})
+
+	meta := json.RawMessage(`{"progressToken":"p","io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}`)
+	schema, found, err := r.ToolSchema(context.Background(), "github__search", meta)
+	if err != nil || !found || string(schema) != `{"type":"object","y":2}` {
+		t.Fatalf("ToolSchema() = %s, %v, %v", schema, found, err)
+	}
+	if len(fs.callLog()) != 0 {
+		t.Errorf("fs got calls %v, want none", fs.callLog())
+	}
+	calls := gh.callLog()
+	if len(calls) != 1 || strings.Contains(calls[0], "progressToken") || !strings.Contains(calls[0], "2026-07-28") {
+		t.Fatalf("github calls = %v, want one tools/list with the caller's _meta minus progressToken", calls)
+	}
+	// Now cached.
+	if _, _, err := r.ToolSchema(context.Background(), "github__search", meta); err != nil || len(gh.callLog()) != 1 {
+		t.Errorf("second ToolSchema() made %d calls, want no new one", len(gh.callLog())-1)
+	}
+}
+
+func TestToolSchemaNotFound(t *testing.T) {
+	up := listing(`{"name":"read","inputSchema":{"type":"object"}}`)
+	r := newRouter(t, Named{Name: "fs", Upstream: up})
+	for _, tool := range []string{"db__query", "noprefix", "fs__missing"} {
+		if schema, found, err := r.ToolSchema(context.Background(), tool, json.RawMessage(validMeta)); found || err != nil || schema != nil {
+			t.Errorf("ToolSchema(%s) = %s, %v, %v, want not found", tool, schema, found, err)
+		}
+	}
+	if n := len(up.callLog()); n != 1 {
+		t.Errorf("upstream got %d calls, want 1 (only fs__missing re-lists)", n)
+	}
+}
+
+func TestToolSchemaReportsListFailure(t *testing.T) {
+	r := newRouter(t, Named{Name: "fs", Upstream: failing(upstream.ErrClosed)})
+	if _, _, err := r.ToolSchema(context.Background(), "fs__read", json.RawMessage(validMeta)); !errors.Is(err, upstream.ErrClosed) {
+		t.Fatalf("ToolSchema() error = %v, want ErrClosed", err)
 	}
 }

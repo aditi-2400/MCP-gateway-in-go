@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/mcp"
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/progress"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/upstream"
 )
 
@@ -427,5 +429,115 @@ func TestSessionIDIsIgnored(t *testing.T) {
 	wantStatus(t, resp, http.StatusOK)
 	if id := resp.Header.Get("Mcp-Session-Id"); id != "" {
 		t.Errorf("Mcp-Session-Id = %q, want none", id)
+	}
+}
+
+// progressHandler acts like an upstream that sends n progress notifications
+// through tracker before answering.
+func progressHandler(tracker *progress.Tracker, n int, answer *jsonrpc.Message) *fakeHandler {
+	return &fakeHandler{answer: func(_ context.Context, _ string, params json.RawMessage) (*jsonrpc.Message, error) {
+		var p struct {
+			Meta struct {
+				ProgressToken json.RawMessage `json:"progressToken"`
+			} `json:"_meta"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		for i := 1; i <= n; i++ {
+			tracker.Deliver(jsonrpc.NewNotification("notifications/progress", json.RawMessage(
+				`{"progressToken":`+string(p.Meta.ProgressToken)+`,"progress":`+strconv.Itoa(i)+`}`)))
+		}
+		return answer, nil
+	}}
+}
+
+// readEvents parses an SSE body into JSON-RPC messages.
+func readEvents(t *testing.T, resp *http.Response) []*jsonrpc.Message {
+	t.Helper()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var msgs []*jsonrpc.Message
+	for _, block := range strings.Split(strings.TrimSpace(string(body)), "\n\n") {
+		var data string
+		for _, line := range strings.Split(block, "\n") {
+			if rest, ok := strings.CutPrefix(line, "data: "); ok {
+				data += rest
+			}
+		}
+		msg, err := jsonrpc.Parse([]byte(data))
+		if err != nil {
+			t.Fatalf("parse event %q: %v", block, err)
+		}
+		msgs = append(msgs, msg)
+	}
+	return msgs
+}
+
+func withProgress(id, token string) string {
+	return `{"jsonrpc":"2.0","id":` + id + `,"method":"tools/list","params":{"_meta":{"progressToken":` + token +
+		`,"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
+}
+
+func TestProgressIsStreamedAsSSE(t *testing.T) {
+	tracker := progress.NewTracker()
+	h := progressHandler(tracker, 2, &jsonrpc.Message{Result: json.RawMessage(`{"done":true}`)})
+	srv := newServer(t, h, Options{Progress: tracker})
+
+	resp := post(t, srv, "tools/list", withProgress("9", `"p-1"`), nil)
+	wantStatus(t, resp, http.StatusOK)
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
+	}
+	if resp.Header.Get("X-Accel-Buffering") != "no" {
+		t.Errorf("X-Accel-Buffering = %q, want no", resp.Header.Get("X-Accel-Buffering"))
+	}
+	msgs := readEvents(t, resp)
+	if len(msgs) != 3 {
+		t.Fatalf("got %d events, want 2 progress and 1 result", len(msgs))
+	}
+	for i, msg := range msgs[:2] {
+		want := `{"progress":` + strconv.Itoa(i+1) + `,"progressToken":"p-1"}`
+		if msg.Method != "notifications/progress" || string(msg.Params) != want {
+			t.Errorf("event %d = %s %s, want %s", i, msg.Method, msg.Params, want)
+		}
+	}
+	if last := msgs[2]; last.ID == nil || *last.ID != jsonrpc.NewIntID(9) || string(last.Result) != `{"done":true}` {
+		t.Errorf("last event = %+v, want the result for id 9", last)
+	}
+}
+
+func TestProgressTokenWithoutProgressIsPlainJSON(t *testing.T) {
+	tracker := progress.NewTracker()
+	tests := []struct {
+		name   string
+		answer *jsonrpc.Message
+		status int
+	}{
+		{name: "result", answer: &jsonrpc.Message{Result: json.RawMessage(`{}`)}, status: http.StatusOK},
+		{name: "method not found keeps its 404", answer: &jsonrpc.Message{Error: &jsonrpc.Error{Code: jsonrpc.CodeMethodNotFound, Message: "nope"}}, status: http.StatusNotFound},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newServer(t, progressHandler(tracker, 0, tt.answer), Options{Progress: tracker})
+			resp := post(t, srv, "tools/list", withProgress("1", `"p"`), nil)
+			wantStatus(t, resp, tt.status)
+			decode(t, resp) // checks Content-Type is application/json
+		})
+	}
+}
+
+func TestWithoutTrackerProgressTokenPassesThrough(t *testing.T) {
+	seen := make(chan string, 1)
+	h := &fakeHandler{answer: func(_ context.Context, _ string, params json.RawMessage) (*jsonrpc.Message, error) {
+		seen <- string(params)
+		return &jsonrpc.Message{Result: json.RawMessage(`{}`)}, nil
+	}}
+	srv := newServer(t, h, Options{})
+	wantStatus(t, post(t, srv, "tools/list", withProgress("1", `"p"`), nil), http.StatusOK)
+	if params := <-seen; !strings.Contains(params, `"progressToken":"p"`) {
+		t.Fatalf("handler saw %s, want the client's token unchanged", params)
 	}
 }

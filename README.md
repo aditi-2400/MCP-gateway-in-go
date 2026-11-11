@@ -4,7 +4,7 @@ A gateway that sits between AI agents and MCP servers.
 
 Agents connect to the gateway as if it were a single MCP server. Behind it, the gateway connects to many upstream MCP servers (filesystem, database, GitHub, and so on). Every tool call goes through the gateway, so it can decide who may call which tool, how often, and with which arguments. It logs every call.
 
-> Status: the gateway runs over stdio in front of several upstream MCP servers, merges their tools under prefixed names, and routes each tool call to the right server. Policy, auth, rate limits, and audit are not built yet, so right now every call is allowed.
+> Status: the gateway runs over stdio or Streamable HTTP in front of several upstream MCP servers, merges their tools under prefixed names, and routes each tool call to the right server. Policy, auth, rate limits, and audit are not built yet, so right now every call is allowed.
 
 ## Why
 
@@ -24,10 +24,12 @@ The gateway targets MCP spec **2026-07-28** only. In this version there is no `i
 ## How it works today
 
 ```
-                                                   ┌──▶ upstream "fs"     (child process)
-client ──stdin/stdout──▶ proxy ──▶ router ─────────┤
-                                                   └──▶ upstream "github" (child process)
+client ──stdin/stdout──▶ proxy ─────┐               ┌──▶ upstream "fs"     (child process)
+                                    ├──▶ router ────┤
+client ──HTTP POST /mcp──▶ httpfront┘               └──▶ upstream "github" (child process)
 ```
+
+One gateway process serves either stdio or HTTP, picked with the `-http` flag.
 
 - **`cmd/gateway`** is the program. It reads the config file, starts every upstream, and runs the proxy on its own stdin and stdout. Logs go to stderr. It stops when the client closes stdin, on Ctrl+C or SIGTERM, or when any upstream exits.
 - **`internal/config`** loads and checks the YAML config.
@@ -35,6 +37,8 @@ client ──stdin/stdout──▶ proxy ──▶ router ───────�
 - **`internal/jsonrpc`** parses and validates every message as untrusted input, and reads and writes one JSON message per line, with a size limit.
 - **`internal/upstream`** starts each MCP server as a child process and checks it with `server/discover` before use. If any upstream fails to start, the gateway refuses to start. It gives each request its own ID and matches each response to the caller waiting for it. On shutdown it closes each child's stdin, then sends SIGTERM, then SIGKILL.
 - **`internal/proxy`** runs the client session. Each request runs on its own goroutine with a timeout, and the reply gets the client's original ID back. When a client cancels a request, the matching upstream call is cancelled.
+- **`internal/httpfront`** serves Streamable HTTP for 2026-07-28. Every message is its own `POST /mcp`, with no sessions. It checks `Origin` against an allowlist, checks that the `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, and `Mcp-Param-*` headers match the body, and answers with the spec's status codes. Closing the connection cancels the request.
+- **`internal/progress`** sends upstream progress notifications back to the request that asked for them. Clients choose their own progress tokens, so two clients can pick the same one; the gateway gives each upstream request its own token and maps it back, the same way it does with request IDs. Over HTTP, progress arrives as an SSE stream.
 - **`internal/router`** decides what each request does. It answers `server/discover` itself and checks the protocol version on every request. `tools/list` asks every upstream at once and returns one list with names like `fs__read_file`. If one upstream fails, its tools are left out and the rest are still listed. `tools/call` goes to the upstream named by the prefix, with the prefix removed. Other methods get "method not found" for now.
 - **`internal/fakeupstream`** is a small MCP server with `echo`, `add`, and `fail` tools, used in tests.
 
@@ -46,7 +50,7 @@ When an upstream doesn't reply, the client gets a JSON-RPC error (`-32603`) sayi
 |---|---|---|
 | Proxy | Runs the MCP session over JSON-RPC 2.0: timeouts, cancellation, request IDs | Built |
 | Multiple upstreams | Merges tools from several servers and prefixes names (`fs__read_file`) so they don't collide | Built |
-| Transports | stdio (for local clients like Claude Desktop) and streamable HTTP | stdio built |
+| Transports | stdio (for local clients like Claude Desktop) and Streamable HTTP | Built (HTTP is localhost only until auth exists) |
 | Auth | API keys per agent, stored hashed | Planned |
 | Policy engine | YAML rules, default deny, argument checks like path prefixes and blocked SQL | Planned |
 | Rate limiting | Token bucket per agent and per tool | Planned |
@@ -74,6 +78,8 @@ internal/fakeupstream/  fake MCP server used in tests
 internal/config/        YAML config loading and validation
 internal/mcp/           protocol version and _meta checks
 internal/router/        discover, merged tools/list, tools/call routing
+internal/httpfront/     Streamable HTTP endpoint and header checks
+internal/progress/      progress token rewriting and routing
 internal/auth/          API key identification (planned)
 internal/policy/        rules engine, YAML loading (planned)
 internal/ratelimit/     per-agent, per-tool limits (planned)
@@ -104,7 +110,10 @@ make build    # builds bin/gateway
 
 ```sh
 gateway -config gateway.yaml [-call-timeout 60s] [-log-level info]
+gateway -config gateway.yaml -http 127.0.0.1:8080 [-allow-origin http://localhost:3000]...
 ```
+
+Without `-http`, the gateway speaks MCP over stdin and stdout. With it, the gateway serves `POST /mcp` and doesn't read stdin. The HTTP address must be loopback (`127.0.0.1`, `::1`, or `localhost`) until the gateway has authentication. Browsers send an `Origin` header, and only origins listed with `-allow-origin` are accepted; requests without `Origin` (curl, SDKs, agents) are fine.
 
 The config file lists the upstream servers. Each name becomes the prefix of that server's tools, so it must be unique and use only lowercase letters, digits, and `-`:
 
@@ -127,6 +136,18 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fake__add"
 
 The reply on stdout includes `"structuredContent":{"sum":5}`. Log lines go to stderr. `make run` starts the same setup and lets you type requests in.
 
+Over HTTP:
+
+```sh
+./bin/gateway -config testdata/config/example.yaml -http 127.0.0.1:8080 &
+curl -s http://127.0.0.1:8080/mcp \
+  -H 'Content-Type: application/json' -H 'MCP-Protocol-Version: 2026-07-28' \
+  -H 'Mcp-Method: tools/call' -H 'Mcp-Name: fake__count' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fake__count","arguments":{"n":2},"_meta":{"progressToken":"t1","io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
+```
+
+Because the request has a `progressToken`, the reply is an SSE stream: two `notifications/progress` events with the token `t1`, then the result. Without a token, or if no progress arrives, the reply is plain JSON.
+
 ## Known limits
 
 - If an upstream stops reading its stdin, a write to it can block the caller.
@@ -134,6 +155,8 @@ The reply on stdout includes `"structuredContent":{"sum":5}`. Log lines go to st
 - Upstreams inherit the gateway's environment variables.
 - If an upstream exits while running, the gateway exits too. There is no reconnect yet.
 - Upstreams are started one after another, so startup time adds up with many upstreams.
+- A slow HTTP or stdio client can hold up an upstream's notifications, since they are written on that upstream's read loop.
+- The gateway doesn't support `subscriptions/listen` yet, so list-changed notifications don't reach clients.
 
 These are planned for Week 5.
 
