@@ -51,7 +51,18 @@ func Serve(in io.Reader, out io.Writer, maxMessageSize int) error {
 		if msg.Kind() != jsonrpc.KindRequest {
 			continue
 		}
-		if err := w.Write(handle(msg)); err != nil {
+		// Progress notifications go out before the response, as the spec asks.
+		var notifyErr error
+		notify := func(n *jsonrpc.Message) {
+			if notifyErr == nil {
+				notifyErr = w.Write(n)
+			}
+		}
+		resp := handle(msg, notify)
+		if notifyErr != nil {
+			return fmt.Errorf("fakeupstream: write notification: %w", notifyErr)
+		}
+		if err := w.Write(resp); err != nil {
 			return fmt.Errorf("fakeupstream: write response: %w", err)
 		}
 	}
@@ -74,7 +85,7 @@ func responseForReadError(err error) (resp *jsonrpc.Message, fatal bool) {
 	}
 }
 
-func handle(req *jsonrpc.Message) *jsonrpc.Message {
+func handle(req *jsonrpc.Message, notify func(*jsonrpc.Message)) *jsonrpc.Message {
 	var result any
 	var rpcErr *jsonrpc.Error
 
@@ -87,7 +98,7 @@ func handle(req *jsonrpc.Message) *jsonrpc.Message {
 		result = toolsListResult()
 	case "tools/call":
 		if rpcErr = checkMeta(req.Params); rpcErr == nil {
-			result, rpcErr = callTool(req.Params)
+			result, rpcErr = callTool(req.Params, notify)
 		}
 	case "initialize":
 		// The spec asks modern-only servers to name their versions here,

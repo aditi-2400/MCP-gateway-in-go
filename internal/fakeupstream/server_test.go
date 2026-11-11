@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -124,8 +125,8 @@ func TestToolsList(t *testing.T) {
 		}
 	}
 	// Order must be stable so clients can cache the list.
-	if got := strings.Join(names, ","); got != "echo,add,fail" {
-		t.Errorf("tool names = %s, want echo,add,fail", got)
+	if got := strings.Join(names, ","); got != "echo,add,fail,count,lookup" {
+		t.Errorf("tool names = %s, want echo,add,fail,count,lookup", got)
 	}
 }
 
@@ -383,5 +384,71 @@ func TestServeReturnsReadErrors(t *testing.T) {
 	err := Serve(iotest.ErrReader(boom), io.Discard, jsonrpc.DefaultMaxMessageSize)
 	if !errors.Is(err, boom) {
 		t.Fatalf("Serve() error = %v, want %v", err, boom)
+	}
+}
+
+// serveAll runs the server and returns every message it wrote, in order.
+func serveAll(t *testing.T, lines ...string) []*jsonrpc.Message {
+	t.Helper()
+	var out bytes.Buffer
+	if err := Serve(strings.NewReader(strings.Join(lines, "\n")+"\n"), &out, jsonrpc.DefaultMaxMessageSize); err != nil {
+		t.Fatalf("Serve() error = %v", err)
+	}
+	r := jsonrpc.NewReader(&out, jsonrpc.DefaultMaxMessageSize)
+	var msgs []*jsonrpc.Message
+	for {
+		msg, err := r.Read()
+		if errors.Is(err, io.EOF) {
+			return msgs
+		}
+		if err != nil {
+			t.Fatalf("server wrote an invalid message: %v", err)
+		}
+		msgs = append(msgs, msg)
+	}
+}
+
+func TestCountSendsProgressBeforeTheResult(t *testing.T) {
+	line := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"count","arguments":{"n":3},` +
+		`"_meta":{"progressToken":"tok-7","io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
+	msgs := serveAll(t, line)
+	if len(msgs) != 4 {
+		t.Fatalf("got %d messages, want 3 progress notifications and 1 response", len(msgs))
+	}
+	for i, msg := range msgs[:3] {
+		want := `{"progressToken":"tok-7","progress":` + strconv.Itoa(i+1) + `,"total":3}`
+		if msg.Method != "notifications/progress" || string(msg.Params) != want {
+			t.Errorf("message %d = %s %s, want progress %s", i, msg.Method, msg.Params, want)
+		}
+	}
+	if msgs[3].Kind() != jsonrpc.KindResponse || !strings.Contains(string(msgs[3].Result), "counted to 3") {
+		t.Errorf("last message = %+v, want the result", msgs[3])
+	}
+}
+
+func TestCountWithoutProgressTokenSendsOnlyTheResult(t *testing.T) {
+	msgs := serveAll(t, request(`1`, "tools/call", `"name":"count","arguments":{"n":3}`))
+	if len(msgs) != 1 || msgs[0].Kind() != jsonrpc.KindResponse {
+		t.Fatalf("got %d messages, want only the response", len(msgs))
+	}
+}
+
+func TestCountRejectsBadN(t *testing.T) {
+	for _, args := range []string{`{}`, `{"n":0}`, `{"n":101}`, `{"n":"3"}`} {
+		var result decodedCallResult
+		decodeResult(t, serveOne(t, request(`1`, "tools/call", `"name":"count","arguments":`+args)), &result)
+		if !result.IsError {
+			t.Errorf("count %s: isError = false, want true", args)
+		}
+	}
+}
+
+func TestLookupEchoesArguments(t *testing.T) {
+	var result struct {
+		StructuredContent json.RawMessage `json:"structuredContent"`
+	}
+	decodeResult(t, serveOne(t, request(`1`, "tools/call", `"name":"lookup","arguments":{"region":"us-west1","limit":5}`)), &result)
+	if string(result.StructuredContent) != `{"region":"us-west1","limit":5}` {
+		t.Fatalf("structuredContent = %s, want the arguments", result.StructuredContent)
 	}
 }
