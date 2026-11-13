@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/auth"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/mcp"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/progress"
@@ -25,8 +26,16 @@ import (
 // Path is the MCP endpoint.
 const Path = "/mcp"
 
+// Authenticator maps an API key to an agent. *auth.Authenticator does.
+type Authenticator interface {
+	Authenticate(key string) (auth.Agent, error)
+}
+
 // Options configures the handler. Zero values pick defaults.
 type Options struct {
+	// Auth checks the Bearer key on every request. If nil, every request is
+	// rejected: a missing authenticator must never mean "no auth".
+	Auth Authenticator
 	// AllowedOrigins lists the exact Origin header values accepted. A request
 	// with any other Origin is rejected; requests without one are allowed.
 	// Empty means every request that sends an Origin is rejected.
@@ -51,6 +60,7 @@ type SchemaSource interface {
 }
 
 type frontend struct {
+	auth           Authenticator
 	handler        proxy.Handler
 	allowedOrigins map[string]bool
 	callTimeout    time.Duration
@@ -73,6 +83,7 @@ func New(h proxy.Handler, opts Options) http.Handler {
 		opts.Logger = slog.New(slog.DiscardHandler)
 	}
 	f := &frontend{
+		auth:           opts.Auth,
 		handler:        h,
 		allowedOrigins: make(map[string]bool, len(opts.AllowedOrigins)),
 		callTimeout:    opts.CallTimeout,
@@ -104,6 +115,19 @@ func (f *frontend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.writeMessage(w, http.StatusForbidden, jsonrpc.NewErrorResponse(nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidRequest, Message: "origin not allowed"}))
 		return
 	}
+	agent, err := f.authenticate(r)
+	if err != nil {
+		// Missing and wrong keys get the same answer, so the response does not
+		// tell a caller which keys exist. The log keeps the reason.
+		f.logger.Warn("rejecting unauthenticated request", "reason", err, "remote", r.RemoteAddr)
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		f.writeMessage(w, http.StatusUnauthorized, jsonrpc.NewErrorResponse(nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidRequest, Message: "unauthorized"}))
+		return
+	}
+	// From here on the agent travels in the context. The key itself goes no
+	// further: it is never passed to the router or any upstream.
+	r = r.WithContext(auth.WithAgent(r.Context(), agent))
+
 	if mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mediaType != "application/json" {
 		w.WriteHeader(http.StatusUnsupportedMediaType)
 		return
@@ -144,6 +168,23 @@ func (f *frontend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Code: jsonrpc.CodeInvalidRequest, Message: "clients must not send responses",
 		}))
 	}
+}
+
+// authenticate reads "Authorization: Bearer <key>". Keys in the URL are
+// never read, as the spec forbids them there.
+func (f *frontend) authenticate(r *http.Request) (auth.Agent, error) {
+	if f.auth == nil {
+		return auth.Agent{}, errors.New("no authenticator configured")
+	}
+	header := r.Header.Get("Authorization")
+	if header == "" {
+		return auth.Agent{}, auth.ErrNoKey
+	}
+	key, ok := auth.ParseBearer(header)
+	if !ok {
+		return auth.Agent{}, fmt.Errorf("%w: Authorization header is not a Bearer token", auth.ErrInvalidKey)
+	}
+	return f.auth.Authenticate(key)
 }
 
 func (f *frontend) serveRequest(w http.ResponseWriter, r *http.Request, req *jsonrpc.Message) {

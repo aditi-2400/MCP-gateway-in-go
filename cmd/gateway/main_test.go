@@ -32,6 +32,14 @@ var fakeUpstreamBin, gatewayBin string
 // testAPIKey belongs to the "tester" agent in every config writeConfig makes.
 var testAPIKey string
 
+// testEnv is the environment run sees in tests: just the test key.
+func testEnv(name string) string {
+	if name == apiKeyEnv {
+		return testAPIKey
+	}
+	return ""
+}
+
 func TestMain(m *testing.M) {
 	os.Exit(runTests(m))
 }
@@ -106,7 +114,7 @@ func startGateway(t *testing.T, ctx context.Context, args ...string) *gateway {
 	}
 
 	go func() {
-		g.done <- run(ctx, args, inR, outW, g.stderr)
+		g.done <- run(ctx, args, inR, outW, g.stderr, testEnv)
 		outW.Close()
 	}()
 	go func() {
@@ -288,7 +296,7 @@ func TestRunRefusesToStartWhenAnUpstreamFails(t *testing.T) {
 		upstreamEntry{name: "good", command: fakeUpstreamBin},
 		upstreamEntry{name: "broken", command: missing},
 	)
-	err := run(context.Background(), []string{"-config", cfg}, strings.NewReader(""), io.Discard, io.Discard)
+	err := run(context.Background(), []string{"-config", cfg}, strings.NewReader(""), io.Discard, io.Discard, testEnv)
 	if err == nil || !strings.Contains(err.Error(), `"broken"`) {
 		t.Fatalf("run() error = %v, want an error naming \"broken\"", err)
 	}
@@ -301,7 +309,7 @@ func TestRunRejectsBadConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, path := range []string{missing, bad} {
-		err := run(context.Background(), []string{"-config", path}, strings.NewReader(""), io.Discard, io.Discard)
+		err := run(context.Background(), []string{"-config", path}, strings.NewReader(""), io.Discard, io.Discard, testEnv)
 		if err == nil || errors.Is(err, errUsage) || !strings.Contains(err.Error(), path) {
 			t.Errorf("run(%s) error = %v, want a config error naming the file", path, err)
 		}

@@ -6,6 +6,7 @@ package main
 import (
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -31,6 +32,8 @@ type gatewayProcess struct {
 func startGatewayProcess(t *testing.T, args ...string) *gatewayProcess {
 	t.Helper()
 	cmd := exec.Command(gatewayBin, args...)
+	// The last value wins, so this overrides any key in the real environment.
+	cmd.Env = append(os.Environ(), apiKeyEnv+"="+testAPIKey)
 	stderr := &syncBuffer{}
 	cmd.Stderr = stderr
 	stdin, err := cmd.StdinPipe()

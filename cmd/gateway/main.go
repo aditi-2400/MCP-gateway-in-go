@@ -6,6 +6,11 @@
 //
 //	gateway -config gateway.yaml [-call-timeout 60s] [-log-level info]
 //	gateway -config gateway.yaml -http 127.0.0.1:8080 [-allow-origin URL]...
+//	gateway keygen -agent NAME
+//
+// Every caller needs an API key from keygen. Over stdio it goes in the
+// MCP_GATEWAY_API_KEY environment variable; over HTTP, in an
+// "Authorization: Bearer" header on every request.
 //
 // Without -http it speaks MCP over stdin and stdout, and logs go to stderr
 // because stdout carries MCP messages. With -http it serves Streamable HTTP
@@ -26,6 +31,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/auth"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/config"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/progress"
@@ -44,7 +50,7 @@ var errUpstreamExited = errors.New("upstream server exited")
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	err := run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
+	err := run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.Getenv)
 	stop()
 
 	switch {
@@ -127,7 +133,13 @@ func usageFailure(fs *flag.FlagSet, msg string) error {
 // It returns nil when the client closes stdin or ctx is cancelled (Ctrl+C or
 // SIGTERM), and an error if the config is bad, an upstream fails to start, or
 // an upstream exits while the client is connected.
-func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+//
+// getenv reads environment variables (os.Getenv in production), so tests can
+// supply a key without changing the real environment.
+func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(string) string) error {
+	if len(args) > 0 && args[0] == "keygen" {
+		return runKeygen(args[1:], stdout, stderr)
+	}
 	f, err := parseFlags(args, stderr)
 	if err != nil {
 		return err
@@ -137,6 +149,21 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return err
 	}
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: f.logLevel}))
+
+	authn, err := auth.New(agentEntries(cfg))
+	if err != nil {
+		return err
+	}
+	if f.httpAddr == "" {
+		// A stdio gateway serves exactly one client, so it checks that
+		// client's key once, before starting any upstream.
+		agent, err := authn.Authenticate(getenv(apiKeyEnv))
+		if err != nil {
+			return fmt.Errorf("%s: %w", apiKeyEnv, err)
+		}
+		logger.Info("agent authenticated", "agent", agent.Name)
+		ctx = auth.WithAgent(ctx, agent)
+	}
 
 	// Upstream read loops start inside StartGroup, but the proxy can only be
 	// built after it. Notifications that arrive before the proxy exists are
@@ -182,7 +209,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 
 	var serveErr error
 	if f.httpAddr != "" {
-		serveErr = serveHTTP(ctx, rt, tracker, group, f, logger)
+		serveErr = serveHTTP(ctx, rt, authn, tracker, group, f, logger)
 	} else {
 		serveErr = serve(ctx, p, group, stdin, stdout)
 	}
@@ -198,6 +225,14 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	}
 	logger.Info("gateway stopped")
 	return errors.Join(serveErr, closeErr)
+}
+
+func agentEntries(cfg *config.Config) []auth.Entry {
+	entries := make([]auth.Entry, len(cfg.Agents))
+	for i, a := range cfg.Agents {
+		entries[i] = auth.Entry{Name: a.Name, KeySHA256: a.KeySHA256}
+	}
+	return entries
 }
 
 func upstreamSpecs(cfg *config.Config) []upstream.Spec {

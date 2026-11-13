@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/auth"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/mcp"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/progress"
@@ -66,8 +67,33 @@ func answerError(rpcErr *jsonrpc.Error) func(context.Context, string, json.RawMe
 	}
 }
 
+// testKey belongs to the "tester" agent that newServer sets up.
+var testKey = mustGenerateKey()
+
+func mustGenerateKey() string {
+	key, err := auth.GenerateKey()
+	if err != nil {
+		panic(err)
+	}
+	return key
+}
+
+func testAuthenticator(t *testing.T) *auth.Authenticator {
+	t.Helper()
+	a, err := auth.New([]auth.Entry{{Name: "tester", KeySHA256: auth.HashKey(testKey)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+// newServer serves h. Unless the test sets its own, it uses an
+// authenticator that accepts testKey.
 func newServer(t *testing.T, h *fakeHandler, opts Options) *httptest.Server {
 	t.Helper()
+	if opts.Auth == nil {
+		opts.Auth = testAuthenticator(t)
+	}
 	srv := httptest.NewServer(New(h, opts))
 	t.Cleanup(srv.Close)
 	return srv
@@ -83,6 +109,7 @@ func post(t *testing.T, srv *httptest.Server, method, body string, extra map[str
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Authorization", "Bearer "+testKey)
 	req.Header.Set("MCP-Protocol-Version", mcp.ProtocolVersion)
 	req.Header.Set("Mcp-Method", method)
 	for k, v := range extra {
@@ -352,6 +379,7 @@ func TestClientDisconnectCancelsCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testKey)
 	req.Header.Set("MCP-Protocol-Version", mcp.ProtocolVersion)
 	req.Header.Set("Mcp-Method", "tools/list")
 
@@ -398,6 +426,7 @@ func TestEachPostIsIndependent(t *testing.T) {
 		go func() {
 			req, _ := http.NewRequest(http.MethodPost, srv.URL+Path, strings.NewReader(request("1", "tools/list", validMeta)))
 			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+testKey)
 			req.Header.Set("MCP-Protocol-Version", mcp.ProtocolVersion)
 			req.Header.Set("Mcp-Method", "tools/list")
 			resp, err := srv.Client().Do(req)
@@ -539,5 +568,102 @@ func TestWithoutTrackerProgressTokenPassesThrough(t *testing.T) {
 	wantStatus(t, post(t, srv, "tools/list", withProgress("1", `"p"`), nil), http.StatusOK)
 	if params := <-seen; !strings.Contains(params, `"progressToken":"p"`) {
 		t.Fatalf("handler saw %s, want the client's token unchanged", params)
+	}
+}
+
+func TestAuthentication(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string // "" means no Authorization header
+		ok     bool
+	}{
+		{name: "valid key", header: "Bearer " + testKey, ok: true},
+		{name: "lowercase scheme", header: "bearer " + testKey, ok: true},
+		{name: "no header", header: ""},
+		{name: "unknown key", header: "Bearer " + mustGenerateKey()},
+		{name: "key without scheme", header: testKey},
+		{name: "basic auth", header: "Basic dGVzdGVyOnBhc3M="},
+		{name: "empty bearer", header: "Bearer "},
+		{name: "hash in place of key", header: "Bearer " + auth.HashKey(testKey)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &fakeHandler{}
+			srv := newServer(t, h, Options{})
+			resp := post(t, srv, "tools/list", request("1", "tools/list", validMeta), map[string]string{"Authorization": tt.header})
+			if tt.ok {
+				wantStatus(t, resp, http.StatusOK)
+				return
+			}
+			msg := wantRPCError(t, resp, http.StatusUnauthorized, jsonrpc.CodeInvalidRequest)
+			if resp.Header.Get("WWW-Authenticate") != "Bearer" {
+				t.Errorf("WWW-Authenticate = %q, want Bearer", resp.Header.Get("WWW-Authenticate"))
+			}
+			// Same message for every failure, so callers can't tell which keys exist.
+			if msg.Error.Message != "unauthorized" || msg.ID != nil {
+				t.Errorf("error = %+v id %v, want \"unauthorized\" with null id", msg.Error, msg.ID)
+			}
+			if h.callCount() != 0 {
+				t.Errorf("handler called %d times without a valid key", h.callCount())
+			}
+		})
+	}
+}
+
+func TestKeyInURLIsIgnored(t *testing.T) {
+	h := &fakeHandler{}
+	srv := newServer(t, h, Options{})
+	req, err := http.NewRequest(http.MethodPost, srv.URL+Path+"?api_key="+testKey+"&access_token="+testKey, strings.NewReader(request("1", "tools/list", validMeta)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("MCP-Protocol-Version", mcp.ProtocolVersion)
+	req.Header.Set("Mcp-Method", "tools/list")
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	wantStatus(t, resp, http.StatusUnauthorized)
+}
+
+func TestNotificationsNeedAKeyToo(t *testing.T) {
+	h := &fakeHandler{}
+	srv := newServer(t, h, Options{})
+	resp := post(t, srv, "notifications/progress", `{"jsonrpc":"2.0","method":"notifications/progress","params":{}}`, map[string]string{"Authorization": ""})
+	wantStatus(t, resp, http.StatusUnauthorized)
+	if got := h.notifiedMethods(); len(got) != 0 {
+		t.Errorf("notified %v without a key", got)
+	}
+}
+
+func TestNoAuthenticatorRejectsEverything(t *testing.T) {
+	h := &fakeHandler{}
+	srv := httptest.NewServer(New(h, Options{}))
+	t.Cleanup(srv.Close)
+	wantStatus(t, post(t, srv, "tools/list", request("1", "tools/list", validMeta), nil), http.StatusUnauthorized)
+}
+
+func TestAgentReachesHandlerButKeyDoesNot(t *testing.T) {
+	type seen struct {
+		agent  string
+		params string
+	}
+	got := make(chan seen, 1)
+	h := &fakeHandler{answer: func(ctx context.Context, _ string, params json.RawMessage) (*jsonrpc.Message, error) {
+		agent, _ := auth.FromContext(ctx)
+		got <- seen{agent.Name, string(params)}
+		return &jsonrpc.Message{Result: json.RawMessage(`{}`)}, nil
+	}}
+	srv := newServer(t, h, Options{})
+	wantStatus(t, post(t, srv, "tools/list", request("1", "tools/list", validMeta), nil), http.StatusOK)
+
+	s := <-got
+	if s.agent != "tester" {
+		t.Errorf("agent in context = %q, want tester", s.agent)
+	}
+	if strings.Contains(s.params, testKey) || strings.Contains(s.params, "Bearer") {
+		t.Errorf("handler params %s contain the key", s.params)
 	}
 }

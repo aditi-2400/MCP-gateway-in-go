@@ -40,6 +40,7 @@ func postMCP(t *testing.T, url, method, name, body string) (int, *jsonrpc.Messag
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("MCP-Protocol-Version", "2026-07-28")
 	req.Header.Set("Mcp-Method", method)
@@ -158,6 +159,7 @@ func postSSE(t *testing.T, url, name, id, token string, n int) []*jsonrpc.Messag
 		return nil
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
 	req.Header.Set("MCP-Protocol-Version", "2026-07-28")
 	req.Header.Set("Mcp-Method", "tools/call")
 	req.Header.Set("Mcp-Name", name)
@@ -234,6 +236,7 @@ func postLookup(t *testing.T, url string, headers map[string]string) (int, *json
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
 	req.Header.Set("MCP-Protocol-Version", "2026-07-28")
 	req.Header.Set("Mcp-Method", "tools/call")
 	req.Header.Set("Mcp-Name", "alpha__lookup")

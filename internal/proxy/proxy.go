@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/auth"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/progress"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/upstream"
@@ -155,7 +156,8 @@ func Forward(ctx context.Context, h Handler, timeout time.Duration, req *jsonrpc
 	}
 
 	// Details go to the log only, so internal paths and hosts do not leak to clients.
-	logger.Warn("upstream call failed", "method", req.Method, "error", err)
+	agent, _ := auth.FromContext(ctx)
+	logger.Warn("upstream call failed", "agent", agent.Name, "method", req.Method, "error", err)
 	msg := "upstream error"
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):

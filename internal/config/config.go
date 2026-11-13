@@ -131,13 +131,8 @@ func (c *Config) validateAgents() error {
 // key there and the error ends up in a log.
 func (a Agent) validate() []error {
 	var errs []error
-	switch {
-	case a.Name == "":
-		errs = append(errs, errors.New("name is required"))
-	case len(a.Name) > maxNameLength:
-		errs = append(errs, fmt.Errorf("name %q must be at most %d characters", a.Name, maxNameLength))
-	case !namePattern.MatchString(a.Name):
-		errs = append(errs, fmt.Errorf("name %q must start with a lowercase letter and use only lowercase letters, digits, and '-'", a.Name))
+	if err := CheckName(a.Name); err != nil {
+		errs = append(errs, err)
 	}
 	switch {
 	case a.KeySHA256 == "":
@@ -150,15 +145,24 @@ func (a Agent) validate() []error {
 	return errs
 }
 
+// CheckName applies the rule for upstream and agent names: a lowercase
+// letter, then lowercase letters, digits, and '-', at most 32 characters.
+func CheckName(name string) error {
+	switch {
+	case name == "":
+		return errors.New("name is required")
+	case len(name) > maxNameLength:
+		return fmt.Errorf("name %q must be at most %d characters", name, maxNameLength)
+	case !namePattern.MatchString(name):
+		return fmt.Errorf("name %q must start with a lowercase letter and use only lowercase letters, digits, and '-'", name)
+	}
+	return nil
+}
+
 func (u Upstream) validate() []error {
 	var errs []error
-	switch {
-	case u.Name == "":
-		errs = append(errs, errors.New("name is required"))
-	case len(u.Name) > maxNameLength:
-		errs = append(errs, fmt.Errorf("name %q must be at most %d characters", u.Name, maxNameLength))
-	case !namePattern.MatchString(u.Name):
-		errs = append(errs, fmt.Errorf("name %q must start with a lowercase letter and use only lowercase letters, digits, and '-'", u.Name))
+	if err := CheckName(u.Name); err != nil {
+		errs = append(errs, err)
 	}
 	if strings.TrimSpace(u.Command) == "" {
 		errs = append(errs, errors.New("command is required"))

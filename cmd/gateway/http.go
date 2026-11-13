@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/auth"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/httpfront"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/progress"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/router"
@@ -48,13 +49,14 @@ func checkLoopback(addr string) error {
 
 // serveHTTP serves Streamable HTTP until ctx is cancelled or an upstream
 // exits, then lets in-flight requests finish before returning.
-func serveHTTP(ctx context.Context, rt *router.Router, tracker *progress.Tracker, group *upstream.Group, f flags, logger *slog.Logger) error {
+func serveHTTP(ctx context.Context, rt *router.Router, authn *auth.Authenticator, tracker *progress.Tracker, group *upstream.Group, f flags, logger *slog.Logger) error {
 	ln, err := net.Listen("tcp", f.httpAddr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", f.httpAddr, err)
 	}
 	srv := &http.Server{
 		Handler: httpfront.New(rt, httpfront.Options{
+			Auth:           authn,
 			AllowedOrigins: f.allowedOrigins,
 			CallTimeout:    f.callTimeout,
 			Logger:         logger.With("component", "http"),
