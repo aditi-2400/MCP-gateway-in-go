@@ -317,6 +317,18 @@ func (r *Router) cachedSchema(upstreamName, tool string) (json.RawMessage, bool)
 	return schema, ok
 }
 
+// KnownTool reports whether a prefixed tool name was in its upstream's last
+// tools/list. It only reads the cache and never calls an upstream, so it is
+// cheap enough for metrics labels.
+func (r *Router) KnownTool(tool string) bool {
+	prefix, _, ok := strings.Cut(tool, Separator)
+	if !ok {
+		return false
+	}
+	_, found := r.cachedSchema(prefix, tool)
+	return found
+}
+
 // ToolSchema returns the inputSchema of a prefixed tool such as fs__read_file.
 // It uses the schemas from the last tools/list, and lists that one upstream
 // again if the tool is not known yet (for example, a client calling without

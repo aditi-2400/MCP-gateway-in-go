@@ -231,6 +231,13 @@ func (r *Recorder) writeWithRetry(batch []Entry) bool {
 	}
 }
 
+// Used reports how many slots are taken: calls in flight plus entries not
+// yet written.
+func (r *Recorder) Used() int { return len(r.slots) }
+
+// Capacity reports the number of slots.
+func (r *Recorder) Capacity() int { return cap(r.slots) }
+
 // Close stops new reservations, waits for reserved calls to commit and for
 // every entry to be written, and stops the writer. If ctx ends first, the
 // entries not yet written are lost and Close says how many. In that case

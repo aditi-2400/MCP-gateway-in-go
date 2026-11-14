@@ -624,3 +624,27 @@ func TestToolSchemaReportsListFailure(t *testing.T) {
 		t.Fatalf("ToolSchema() error = %v, want ErrClosed", err)
 	}
 }
+
+func TestKnownTool(t *testing.T) {
+	fs := listing(`{"name":"read","inputSchema":{"type":"object"}}`)
+	r := newRouter(t, Named{Name: "fs", Upstream: fs})
+	if r.KnownTool("fs__read") {
+		t.Error("fs__read known before any tools/list")
+	}
+	toolNames(t, r)
+	for tool, want := range map[string]bool{
+		"fs__read":    true,
+		"fs__made_up": false,
+		"db__read":    false,
+		"read":        false,
+		"fs__":        false,
+		"FS__read":    false,
+	} {
+		if got := r.KnownTool(tool); got != want {
+			t.Errorf("KnownTool(%q) = %v, want %v", tool, got, want)
+		}
+	}
+	if n := len(fs.callLog()); n != 1 {
+		t.Errorf("upstream got %d calls, want only the one tools/list: KnownTool must not call upstreams", n)
+	}
+}

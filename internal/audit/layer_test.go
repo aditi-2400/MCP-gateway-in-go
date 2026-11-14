@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -268,5 +269,55 @@ func TestUpstreamTimer(t *testing.T) {
 	}
 	if got := n.Get(); !got.Forwarded || got.Latency != 42*time.Millisecond {
 		t.Errorf("note = %+v, want forwarded with 42ms", got)
+	}
+}
+
+type fakeObserver struct {
+	mu      sync.Mutex
+	done    []Entry
+	totals  []time.Duration
+	refused int
+}
+
+func (o *fakeObserver) CallDone(e Entry, total time.Duration) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.done = append(o.done, e)
+	o.totals = append(o.totals, total)
+}
+
+func (o *fakeObserver) CallRefused() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.refused++
+}
+
+func TestLayerTellsTheObserver(t *testing.T) {
+	store := &fakeStore{hold: make(chan struct{})}
+	defer close(store.hold)
+	rec := NewRecorder(store, Options{QueueSize: 1, ReserveWait: testWait})
+	layer := NewLayer(&scriptedNext{do: func(ctx context.Context) (*jsonrpc.Message, error) {
+		note.Allow(ctx, "ok", "r: x__y")
+		return okResult(), nil
+	}}, rec, nil)
+	obs := &fakeObserver{}
+	layer.SetObserver(obs)
+	clock := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	layer.now = func() time.Time { clock = clock.Add(5 * time.Millisecond); return clock }
+
+	layer.Call(asAgent("a"), "tools/call", json.RawMessage(`{"name":"x__y"}`))
+	layer.Call(asAgent("a"), "tools/call", json.RawMessage(`{"name":"x__y"}`)) // queue full: refused
+	layer.Call(asAgent("a"), "tools/list", json.RawMessage(`{}`))              // not a tool call
+
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if len(obs.done) != 1 || obs.done[0].Decision != Allowed || obs.done[0].Tool != "x__y" {
+		t.Fatalf("observer saw %+v, want one allowed x__y call", obs.done)
+	}
+	if obs.totals[0] != 5*time.Millisecond {
+		t.Errorf("total = %v, want 5ms", obs.totals[0])
+	}
+	if obs.refused != 1 {
+		t.Errorf("refused = %d, want 1", obs.refused)
 	}
 }

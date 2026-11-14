@@ -38,14 +38,36 @@ type Layer struct {
 	rec    *Recorder
 	logger *slog.Logger
 	now    func() time.Time
+	obs    Observer
 }
+
+// Observer hears about every audited call, for metrics. It is called on the
+// request's goroutine, so it must be quick and must not block.
+type Observer interface {
+	// CallDone gets the finished entry and the call's total time in the
+	// gateway.
+	CallDone(e Entry, total time.Duration)
+	// CallRefused is told about a call refused because the audit log had no
+	// room. Such calls have no entry.
+	CallRefused()
+}
+
+type noObserver struct{}
+
+func (noObserver) CallDone(Entry, time.Duration) {}
+func (noObserver) CallRefused()                  {}
 
 // NewLayer returns a Layer that records calls passing to next.
 func NewLayer(next Handler, rec *Recorder, logger *slog.Logger) *Layer {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	return &Layer{next: next, rec: rec, logger: logger, now: time.Now}
+	return &Layer{next: next, rec: rec, logger: logger, now: time.Now, obs: noObserver{}}
+}
+
+// SetObserver sets who hears about calls. Call it before the layer serves.
+func (l *Layer) SetObserver(o Observer) {
+	l.obs = o
 }
 
 // Call audits tools/call and passes everything else on.
@@ -59,6 +81,7 @@ func (l *Layer) Call(ctx context.Context, method string, params json.RawMessage)
 			return nil, err // the client gave up; nothing to answer
 		}
 		l.logger.Error("refusing tools/call: audit log unavailable", "error", err)
+		l.obs.CallRefused()
 		return &jsonrpc.Message{Error: &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: "audit log unavailable"}}, nil
 	}
 
@@ -77,6 +100,7 @@ func (l *Layer) Call(ctx context.Context, method string, params json.RawMessage)
 	defer func() {
 		fillOutcome(&entry, n.Get(), resp, err)
 		slot.Commit(entry)
+		l.obs.CallDone(entry, l.now().Sub(entry.Time))
 	}()
 	return l.next.Call(ctx, method, params)
 }
