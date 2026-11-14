@@ -364,6 +364,15 @@ func TestParseFlags(t *testing.T) {
 		{name: "http on a hostname", args: []string{"-config", "g.yaml", "-http", "example.com:8080"}, wantErr: errUsage},
 		{name: "http without port", args: []string{"-config", "g.yaml", "-http", "127.0.0.1"}, wantErr: errUsage},
 		{name: "origins without http", args: []string{"-config", "g.yaml", "-allow-origin", "http://a"}, wantErr: errUsage},
+		{name: "all interfaces with TLS", args: []string{"-config", "g.yaml", "-http", "0.0.0.0:8443", "-tls-cert", "c.pem", "-tls-key", "k.pem"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "0.0.0.0:8443"},
+		{name: "LAN address with TLS", args: []string{"-config", "g.yaml", "-http", "192.168.1.10:8443", "-tls-cert", "c.pem", "-tls-key", "k.pem"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "192.168.1.10:8443"},
+		{name: "all interfaces behind a TLS proxy", args: []string{"-config", "g.yaml", "-http", ":8080", "-behind-tls-proxy"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: ":8080"},
+		{name: "loopback with TLS", args: []string{"-config", "g.yaml", "-http", "127.0.0.1:8443", "-tls-cert", "c.pem", "-tls-key", "k.pem"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "127.0.0.1:8443"},
+		{name: "cert without key", args: []string{"-config", "g.yaml", "-http", "0.0.0.0:8443", "-tls-cert", "c.pem"}, wantErr: errUsage},
+		{name: "key without cert", args: []string{"-config", "g.yaml", "-http", "0.0.0.0:8443", "-tls-key", "k.pem"}, wantErr: errUsage},
+		{name: "TLS and proxy together", args: []string{"-config", "g.yaml", "-http", "0.0.0.0:8443", "-tls-cert", "c.pem", "-tls-key", "k.pem", "-behind-tls-proxy"}, wantErr: errUsage},
+		{name: "TLS without http", args: []string{"-config", "g.yaml", "-tls-cert", "c.pem", "-tls-key", "k.pem"}, wantErr: errUsage},
+		{name: "proxy flag without http", args: []string{"-config", "g.yaml", "-behind-tls-proxy"}, wantErr: errUsage},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

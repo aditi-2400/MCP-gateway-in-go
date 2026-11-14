@@ -50,7 +50,7 @@ When an upstream doesn't reply, the client gets a JSON-RPC error (`-32603`) sayi
 |---|---|---|
 | Proxy | Runs the MCP session over JSON-RPC 2.0: timeouts, cancellation, request IDs | Built |
 | Multiple upstreams | Merges tools from several servers and prefixes names (`fs__read_file`) so they don't collide | Built |
-| Transports | stdio (for local clients like Claude Desktop) and Streamable HTTP | Built (HTTP is localhost only until auth exists) |
+| Transports | stdio (for local clients like Claude Desktop) and Streamable HTTP, with optional TLS | Built |
 | Auth | API keys per agent, stored hashed | Built |
 | Policy engine | YAML rules, default deny, argument checks like path prefixes and blocked SQL | Planned |
 | Rate limiting | Token bucket per agent and per tool | Planned |
@@ -111,10 +111,12 @@ make build    # builds bin/gateway
 ```sh
 gateway -config gateway.yaml [-call-timeout 60s] [-log-level info]
 gateway -config gateway.yaml -http 127.0.0.1:8080 [-allow-origin http://localhost:3000]...
+gateway -config gateway.yaml -http 0.0.0.0:8443 -tls-cert cert.pem -tls-key key.pem
+gateway -config gateway.yaml -http :8080 -behind-tls-proxy
 gateway keygen -agent NAME
 ```
 
-Without `-http`, the gateway speaks MCP over stdin and stdout. With it, the gateway serves `POST /mcp` and doesn't read stdin. The HTTP address must be loopback (`127.0.0.1`, `::1`, or `localhost`) for now: keys sent over plain HTTP on a network could be read by anyone in between, so wider listening waits for TLS. Browsers send an `Origin` header, and only origins listed with `-allow-origin` are accepted; requests without `Origin` (curl, SDKs, agents) are fine.
+Without `-http`, the gateway speaks MCP over stdin and stdout. With it, the gateway serves `POST /mcp` and doesn't read stdin. On a loopback address (`127.0.0.1`, `::1`, `localhost`) plain HTTP is fine. Any other address needs encryption, because every request carries an API key: either `-tls-cert` and `-tls-key` (HTTPS, TLS 1.2 or newer), or `-behind-tls-proxy` when nginx, Caddy, or a load balancer in front handles HTTPS. Without one of those the gateway refuses to start. Browsers send an `Origin` header, and only origins listed with `-allow-origin` are accepted; requests without `Origin` (curl, SDKs, agents) are fine.
 
 The config file lists the upstream servers. Each name becomes the prefix of that server's tools, so it must be unique and use only lowercase letters, digits, and `-`:
 

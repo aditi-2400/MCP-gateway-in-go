@@ -2,9 +2,20 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"io"
+	"math/big"
+	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -279,4 +290,115 @@ func TestRunHTTPChecksMcpParamHeaders(t *testing.T) {
 			t.Errorf("%s: %d %v, want 400 with -32020", name, status, resp.Error)
 		}
 	}
+}
+
+// writeSelfSignedCert makes a throwaway certificate for 127.0.0.1 and
+// returns the cert and key file paths, plus a pool that trusts it.
+func writeSelfSignedCert(t *testing.T) (certFile, keyFile string, pool *x509.CertPool) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "gateway test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	certFile, keyFile = filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool = x509.NewCertPool()
+	pool.AddCert(cert)
+	return certFile, keyFile, pool
+}
+
+func TestRunServesHTTPS(t *testing.T) {
+	certFile, keyFile, pool := writeSelfSignedCert(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g := startGateway(t, ctx, "-config", fakeConfig(t, "fake"), "-http", "127.0.0.1:0", "-tls-cert", certFile, "-tls-key", keyFile)
+	if !strings.Contains(waitForLog(t, g.stderr, "scheme=https"), "scheme=https") {
+		t.Fatal("listen log does not say https")
+	}
+	addr := strings.TrimSuffix(strings.TrimPrefix(waitForHTTP(t, g.stderr), "http://"), "/mcp")
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}}
+	req, _ := http.NewRequest(http.MethodPost, "https://"+addr+"/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{`+validMeta+`}}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	req.Header.Set("MCP-Protocol-Version", "2026-07-28")
+	req.Header.Set("Mcp-Method", "tools/list")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("HTTPS request: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), `"name":"fake__echo"`) {
+		t.Fatalf("HTTPS tools/list = %d %s", resp.StatusCode, body)
+	}
+
+	// Plain HTTP to the TLS port must not get through.
+	plain, err := http.Post("http://"+addr+"/mcp", "application/json", strings.NewReader("{}"))
+	if err == nil {
+		plain.Body.Close()
+		if plain.StatusCode != http.StatusBadRequest {
+			t.Errorf("plain HTTP to the TLS port: status %d, want 400", plain.StatusCode)
+		}
+	}
+}
+
+func TestRunRejectsBadTLSFilesBeforeStartingAnything(t *testing.T) {
+	bad := filepath.Join(t.TempDir(), "not-a-cert.pem")
+	if err := os.WriteFile(bad, []byte("nope"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// syncBuffer, because upstream child processes also write to stderr.
+	stderr := &syncBuffer{}
+	err := run(context.Background(), []string{"-config", fakeConfig(t, "fake"), "-http", "127.0.0.1:0", "-tls-cert", bad, "-tls-key", bad},
+		strings.NewReader(""), io.Discard, stderr, testEnv)
+	if err == nil || !strings.Contains(err.Error(), "TLS certificate") {
+		t.Fatalf("run() error = %v, want a TLS certificate error", err)
+	}
+	for _, line := range []string{"upstream started", "http listening"} {
+		if strings.Contains(stderr.String(), line) {
+			t.Errorf("logged %q before the certificate was checked", line)
+		}
+	}
+}
+
+// waitForLog waits until stderr contains want and returns everything so far.
+func waitForLog(t *testing.T, stderr *syncBuffer, want string) string {
+	t.Helper()
+	deadline := time.Now().Add(testTimeout)
+	for time.Now().Before(deadline) {
+		if s := stderr.String(); strings.Contains(s, want) {
+			return s
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("stderr never contained %q:\n%s", want, stderr)
+	return ""
 }

@@ -70,6 +70,9 @@ type flags struct {
 	logLevel       slog.Level
 	httpAddr       string // empty means stdio
 	allowedOrigins stringList
+	tlsCert        string
+	tlsKey         string
+	behindTLSProxy bool
 }
 
 // stringList is a flag that can be given more than once.
@@ -94,8 +97,11 @@ func parseFlags(args []string, stderr io.Writer) (flags, error) {
 	fs.StringVar(&f.configPath, "config", "", "path to the YAML config file listing upstream servers (required)")
 	fs.DurationVar(&f.callTimeout, "call-timeout", proxy.DefaultCallTimeout, "how long each request may wait for the upstreams")
 	fs.TextVar(&f.logLevel, "log-level", f.logLevel, "log level: debug, info, warn, or error")
-	fs.StringVar(&f.httpAddr, "http", "", "serve Streamable HTTP on this loopback address (e.g. 127.0.0.1:8080) in place of stdio")
+	fs.StringVar(&f.httpAddr, "http", "", "serve Streamable HTTP on this address (e.g. 127.0.0.1:8080) in place of stdio; non-loopback addresses need TLS or -behind-tls-proxy")
 	fs.Var(&f.allowedOrigins, "allow-origin", "browser Origin allowed to call the HTTP endpoint (repeatable)")
+	fs.StringVar(&f.tlsCert, "tls-cert", "", "PEM certificate file; serve HTTPS (needs -tls-key)")
+	fs.StringVar(&f.tlsKey, "tls-key", "", "PEM private key file for -tls-cert")
+	fs.BoolVar(&f.behindTLSProxy, "behind-tls-proxy", false, "allow plain HTTP on a non-loopback address because a proxy in front terminates TLS")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -112,13 +118,8 @@ func parseFlags(args []string, stderr io.Writer) (flags, error) {
 	if f.callTimeout <= 0 {
 		return flags{}, usageFailure(fs, "-call-timeout must be positive")
 	}
-	if f.httpAddr == "" && len(f.allowedOrigins) > 0 {
-		return flags{}, usageFailure(fs, "-allow-origin needs -http")
-	}
-	if f.httpAddr != "" {
-		if err := checkLoopback(f.httpAddr); err != nil {
-			return flags{}, usageFailure(fs, err.Error())
-		}
+	if err := checkHTTPFlags(f); err != nil {
+		return flags{}, usageFailure(fs, err.Error())
 	}
 	return f, nil
 }
@@ -151,6 +152,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: f.logLevel}))
 
 	authn, err := auth.New(agentEntries(cfg))
+	if err != nil {
+		return err
+	}
+	tlsConfig, err := loadTLS(f)
 	if err != nil {
 		return err
 	}
@@ -209,7 +214,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 
 	var serveErr error
 	if f.httpAddr != "" {
-		serveErr = serveHTTP(ctx, rt, authn, tracker, group, f, logger)
+		serveErr = serveHTTP(ctx, rt, authn, tracker, group, f, tlsConfig, logger)
 	} else {
 		serveErr = serve(ctx, p, group, stdin, stdout)
 	}
