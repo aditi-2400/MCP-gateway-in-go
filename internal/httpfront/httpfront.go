@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/mcp"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/progress"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/proxy"
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/ratelimit"
 )
 
 // Path is the MCP endpoint.
@@ -287,6 +289,8 @@ func statusFor(rpcErr *jsonrpc.Error) int {
 		return http.StatusNotFound
 	case mcp.CodeUnsupportedProtocolVersion, mcp.CodeHeaderMismatch:
 		return http.StatusBadRequest
+	case ratelimit.CodeRateLimited:
+		return http.StatusTooManyRequests
 	default:
 		return http.StatusOK
 	}
@@ -371,8 +375,19 @@ func (f *frontend) writeMessage(w http.ResponseWriter, status int, msg *jsonrpc.
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	if wait, ok := ratelimit.RetryAfter(msg.Error); ok {
+		w.Header().Set("Retry-After", retryAfterSeconds(wait))
+	}
 	w.WriteHeader(status)
 	if _, err := w.Write(data); err != nil {
 		f.logger.Debug("write response", "error", err)
 	}
+}
+
+// retryAfterSeconds formats a wait for the Retry-After header, which takes
+// whole seconds. It rounds up and never says 0, so a client that waits as
+// told finds a token.
+func retryAfterSeconds(wait time.Duration) string {
+	secs := int64((wait + time.Second - 1) / time.Second)
+	return strconv.FormatInt(max(secs, 1), 10)
 }

@@ -4,7 +4,7 @@ A gateway that sits between AI agents and MCP servers.
 
 Agents connect to the gateway as if it were a single MCP server. Behind it, the gateway connects to many upstream MCP servers (filesystem, database, GitHub, and so on). Every tool call goes through the gateway, so it can decide who may call which tool, how often, and with which arguments. It logs every call.
 
-> Status: the gateway runs over stdio or Streamable HTTP in front of several upstream MCP servers, merges their tools under prefixed names, and routes each tool call to the right server. Every caller needs an API key, and a policy file decides which tools each agent can see and call, with checks on the arguments. Rate limits and audit are not built yet.
+> Status: the gateway runs over stdio or Streamable HTTP in front of several upstream MCP servers, merges their tools under prefixed names, and routes each tool call to the right server. Every caller needs an API key, and a policy file decides which tools each agent can see and call, with checks on the arguments and a rate limit per agent and tool. The audit log is not built yet.
 
 ## Why
 
@@ -24,9 +24,9 @@ The gateway targets MCP spec **2026-07-28** only. In this version there is no `i
 ## How it works today
 
 ```
-client ──stdin/stdout──▶ proxy ─────┐                         ┌──▶ upstream "fs"     (child process)
-                                    ├──▶ policy ──▶ router ───┤
-client ──HTTP POST /mcp──▶ httpfront┘                         └──▶ upstream "github" (child process)
+client ──stdin/stdout──▶ proxy ─────┐                                        ┌──▶ upstream "fs"     (child process)
+                                    ├──▶ policy ──▶ ratelimit ──▶ router ────┤
+client ──HTTP POST /mcp──▶ httpfront┘                                        └──▶ upstream "github" (child process)
 ```
 
 One gateway process serves either stdio or HTTP, picked with the `-http` flag.
@@ -41,6 +41,7 @@ One gateway process serves either stdio or HTTP, picked with the `-http` flag.
 - **`internal/progress`** sends upstream progress notifications back to the request that asked for them. Clients choose their own progress tokens, so two clients can pick the same one; the gateway gives each upstream request its own token and maps it back, the same way it does with request IDs. Over HTTP, progress arrives as an SSE stream.
 - **`internal/router`** decides what each request does. It answers `server/discover` itself and checks the protocol version on every request. `tools/list` asks every upstream at once and returns one list with names like `fs__read_file`. If one upstream fails, its tools are left out and the rest are still listed. `tools/call` goes to the upstream named by the prefix, with the prefix removed. Other methods get "method not found" for now.
 - **`internal/policy`** loads the policy file and sits in front of the router. It reads the agent that auth attached to the request, hides tools the agent may not call from `tools/list`, and checks every `tools/call` before it reaches the router. Methods it has no rule for are refused, so a method added to the router later can't skip the policy by accident.
+- **`internal/ratelimit`** sits between the policy and the router, so calls the policy denies never use up tokens. Each agent has a token bucket per tool. A call that finds its bucket empty gets error `-31029` and never reaches the upstream.
 - **`internal/fakeupstream`** is a small MCP server with `echo`, `add`, and `fail` tools, used in tests.
 
 When an upstream doesn't reply, the client gets a JSON-RPC error (`-32603`) saying "upstream timed out", "upstream unavailable", or "upstream error". The details go to the log only. Calls are never retried.
@@ -54,7 +55,7 @@ When an upstream doesn't reply, the client gets a JSON-RPC error (`-32603`) sayi
 | Transports | stdio (for local clients like Claude Desktop) and Streamable HTTP, with optional TLS | Built |
 | Auth | API keys per agent, stored hashed | Built |
 | Policy engine | YAML rules, default deny, argument checks like path prefixes and blocked SQL | Built |
-| Rate limiting | Token bucket per agent and per tool | Planned |
+| Rate limiting | Token bucket per agent and per tool | Built |
 | Audit log | Append-only JSON in SQLite with redacted arguments | Planned |
 | Observability | Prometheus metrics and OpenTelemetry traces | Planned |
 | Resilience | Timeouts, circuit breakers, no automatic retries on tools with side effects | Timeouts built |
@@ -83,7 +84,7 @@ internal/httpfront/     Streamable HTTP endpoint and header checks
 internal/progress/      progress token rewriting and routing
 internal/auth/          API key identification
 internal/policy/        rules, argument checks, and the guard in front of the router
-internal/ratelimit/     per-agent, per-tool limits (planned)
+internal/ratelimit/     per-agent, per-tool token buckets
 internal/audit/         append-only structured log (planned)
 internal/metrics/       Prometheus and OpenTelemetry (planned)
 internal/pinning/       tool description hashing and quarantine (planned)
@@ -195,7 +196,7 @@ limits:
 - `deny_patterns` are Go regular expressions, always matched without regard to case. `max_length` counts bytes.
 - Arguments with a repeated key or invalid UTF-8 are denied, so the gateway can't check one value while the upstream reads another.
 - When arguments fail a check, the agent gets a tool result with `isError: true`, like `Denied by gateway policy: argument "path" is outside the allowed folders`. The spec says clients should show these to the model, so it can try again. The message never includes the folders, the patterns, or the argument's value. The log line names the agent, the tool, the role, and which pattern matched.
-- `limits:` is required and needs a `default`, so no tool is ever unlimited. Each agent gets its own token bucket for each tool: `burst` calls can come at once, and `rate` says how fast they come back. An exact tool entry wins over `upstream__*`, which wins over `default`. With `github__*`, each GitHub tool is counted on its own. Limits are checked when the file loads; the gateway starts enforcing them in the next step.
+- `limits:` is required and needs a `default`, so no tool is ever unlimited. Each agent gets its own token bucket for each tool: `burst` calls can come at once, and `rate` says how fast they come back. An exact tool entry wins over `upstream__*`, which wins over `default`. With `github__*`, each GitHub tool is counted on its own. A call over the limit gets JSON-RPC error `-31029` with `data.retryAfterMs`, the wait until the next token. Over HTTP the status is `429` with a `Retry-After` header in seconds. The code sits outside the range the spec reserves (`-32768` to `-32000`), as the spec asks. Calls the policy denies don't use up tokens, and only `tools/call` is counted.
 - If the policy file is missing, invalid, or names an upstream or agent the config doesn't have, the gateway refuses to start. If the guard can't check something, the call is denied.
 
 Limits to know about:

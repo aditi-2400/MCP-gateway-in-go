@@ -37,6 +37,7 @@ import (
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/policy"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/progress"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/proxy"
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/ratelimit"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/router"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/upstream"
 )
@@ -215,7 +216,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	if err != nil {
 		return errors.Join(err, group.Close())
 	}
-	guard := policy.NewGuard(rt, rt, pol, logger.With("component", "policy"))
+	// Requests go guard, then rate limit, then router: calls the policy
+	// denies never use up an agent's tokens.
+	limited := ratelimit.NewEnforcer(rt, pol, ratelimit.New(time.Now), logger.With("component", "ratelimit"))
+	guard := policy.NewGuard(limited, rt, pol, logger.With("component", "policy"))
 	p := proxy.New(guard, proxy.Options{
 		CallTimeout: f.callTimeout,
 		Logger:      logger.With("component", "proxy"),

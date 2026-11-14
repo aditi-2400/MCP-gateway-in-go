@@ -17,6 +17,7 @@ import (
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/mcp"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/progress"
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/ratelimit"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/upstream"
 )
 
@@ -337,6 +338,7 @@ func TestStatusCodesFollowErrors(t *testing.T) {
 		{name: "method not found", answer: answerError(&jsonrpc.Error{Code: jsonrpc.CodeMethodNotFound, Message: "Method not found"}), status: http.StatusNotFound, code: jsonrpc.CodeMethodNotFound},
 		{name: "unsupported version", answer: answerError(&jsonrpc.Error{Code: mcp.CodeUnsupportedProtocolVersion, Message: "Unsupported protocol version"}), status: http.StatusBadRequest, code: mcp.CodeUnsupportedProtocolVersion},
 		{name: "invalid params", answer: answerError(&jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: "Unknown tool: x"}), status: http.StatusOK, code: jsonrpc.CodeInvalidParams},
+		{name: "rate limited", answer: answerError(&jsonrpc.Error{Code: ratelimit.CodeRateLimited, Message: "Rate limit exceeded for tool x", Data: json.RawMessage(`{"retryAfterMs":1000}`)}), status: http.StatusTooManyRequests, code: ratelimit.CodeRateLimited},
 		{name: "upstream gone", answer: func(context.Context, string, json.RawMessage) (*jsonrpc.Message, error) {
 			return nil, upstream.ErrClosed
 		}, status: http.StatusOK, code: jsonrpc.CodeInternalError},
@@ -665,5 +667,35 @@ func TestAgentReachesHandlerButKeyDoesNot(t *testing.T) {
 	}
 	if strings.Contains(s.params, testKey) || strings.Contains(s.params, "Bearer") {
 		t.Errorf("handler params %s contain the key", s.params)
+	}
+}
+
+func TestRateLimitSetsRetryAfter(t *testing.T) {
+	tests := []struct {
+		data string
+		want string
+	}{
+		{data: `{"retryAfterMs":12000}`, want: "12"},
+		{data: `{"retryAfterMs":1500}`, want: "2"}, // rounds up
+		{data: `{"retryAfterMs":1}`, want: "1"},
+		{data: `{"retryAfterMs":0}`, want: "1"}, // never 0
+		{data: `"unreadable"`, want: ""},        // 429 still, but no header to guess
+	}
+	for _, tt := range tests {
+		t.Run(tt.data, func(t *testing.T) {
+			answer := answerError(&jsonrpc.Error{Code: ratelimit.CodeRateLimited, Message: "Rate limit exceeded for tool x", Data: json.RawMessage(tt.data)})
+			srv := newServer(t, &fakeHandler{answer: answer}, Options{})
+			resp := post(t, srv, "tools/list", request("1", "tools/list", validMeta), nil)
+			if got := resp.Header.Get("Retry-After"); got != tt.want {
+				t.Errorf("Retry-After = %q, want %q", got, tt.want)
+			}
+			wantRPCError(t, resp, http.StatusTooManyRequests, ratelimit.CodeRateLimited)
+		})
+	}
+
+	// Other errors get no Retry-After.
+	srv := newServer(t, &fakeHandler{answer: answerError(&jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: "x"})}, Options{})
+	if got := post(t, srv, "tools/list", request("1", "tools/list", validMeta), nil).Header.Get("Retry-After"); got != "" {
+		t.Errorf("Retry-After on another error = %q, want none", got)
 	}
 }
