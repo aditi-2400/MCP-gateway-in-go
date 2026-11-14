@@ -1,0 +1,14 @@
+# Example policy for example.yaml. Everything is denied unless a rule here
+# allows it.
+#
+# Roles hold rules. A rule names one tool (fake__echo) or every tool of one
+# upstream (fake__*). Agents get roles; an agent missing from this file, or
+# with no roles, can call nothing.
+roles:
+  basic:
+    allow:
+      - tool: fake__echo
+      - tool: fake__add
+
+agents:
+  example: [basic]
