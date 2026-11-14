@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/audit/note"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/auth"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
 )
@@ -174,4 +175,19 @@ func jsonrpcErrorJSON(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return string(data)
+}
+
+func TestEnforcerNotesLimits(t *testing.T) {
+	e, _, _ := newTestEnforcer()
+	ctx, n := note.New(agentCtx("bot"))
+	call(e, ctx, "email__send")
+	if got := n.Get(); got.Decision != "" {
+		t.Fatalf("allowed call noted %+v; the limiter only notes refusals", got)
+	}
+	call(e, ctx, "email__send")
+	call(e, ctx, "email__send")
+	got := n.Get()
+	if got.Decision != note.RateLimited || got.Rule != "email__send" || !strings.Contains(got.Reason, "5/minute, burst 2") || !strings.Contains(got.Reason, "retry in 12s") {
+		t.Errorf("note = %+v, want rate_limited by email__send with the limit and wait", got)
+	}
 }

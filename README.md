@@ -4,7 +4,7 @@ A gateway that sits between AI agents and MCP servers.
 
 Agents connect to the gateway as if it were a single MCP server. Behind it, the gateway connects to many upstream MCP servers (filesystem, database, GitHub, and so on). Every tool call goes through the gateway, so it can decide who may call which tool, how often, and with which arguments. It logs every call.
 
-> Status: the gateway runs over stdio or Streamable HTTP in front of several upstream MCP servers, merges their tools under prefixed names, and routes each tool call to the right server. Every caller needs an API key, and a policy file decides which tools each agent can see and call, with checks on the arguments and a rate limit per agent and tool. The audit log is not built yet.
+> Status: the gateway runs over stdio or Streamable HTTP in front of several upstream MCP servers, merges their tools under prefixed names, and routes each tool call to the right server. Every caller needs an API key, and a policy file decides which tools each agent can see and call, with checks on the arguments and a rate limit per agent and tool. Every tool call is recorded in a SQLite audit log, with secrets taken out of the arguments.
 
 ## Why
 
@@ -24,9 +24,9 @@ The gateway targets MCP spec **2026-07-28** only. In this version there is no `i
 ## How it works today
 
 ```
-client ──stdin/stdout──▶ proxy ─────┐                                        ┌──▶ upstream "fs"     (child process)
-                                    ├──▶ policy ──▶ ratelimit ──▶ router ────┤
-client ──HTTP POST /mcp──▶ httpfront┘                                        └──▶ upstream "github" (child process)
+client ──stdin/stdout──▶ proxy ─────┐                                                   ┌──▶ upstream "fs"     (child process)
+                                    ├──▶ audit ──▶ policy ──▶ ratelimit ──▶ router ─────┤
+client ──HTTP POST /mcp──▶ httpfront┘                                                   └──▶ upstream "github" (child process)
 ```
 
 One gateway process serves either stdio or HTTP, picked with the `-http` flag.
@@ -41,6 +41,7 @@ One gateway process serves either stdio or HTTP, picked with the `-http` flag.
 - **`internal/progress`** sends upstream progress notifications back to the request that asked for them. Clients choose their own progress tokens, so two clients can pick the same one; the gateway gives each upstream request its own token and maps it back, the same way it does with request IDs. Over HTTP, progress arrives as an SSE stream.
 - **`internal/router`** decides what each request does. It answers `server/discover` itself and checks the protocol version on every request. `tools/list` asks every upstream at once and returns one list with names like `fs__read_file`. If one upstream fails, its tools are left out and the rest are still listed. `tools/call` goes to the upstream named by the prefix, with the prefix removed. Other methods get "method not found" for now.
 - **`internal/policy`** loads the policy file and sits in front of the router. It reads the agent that auth attached to the request, hides tools the agent may not call from `tools/list`, and checks every `tools/call` before it reaches the router. Methods it has no rule for are refused, so a method added to the router later can't skip the policy by accident.
+- **`internal/audit`** comes first for every `tools/call`. It reserves room in the audit queue before anything else runs, so a call that can't be recorded is refused. When the call ends it writes one entry, whatever happened. Entries go to SQLite in the background.
 - **`internal/ratelimit`** sits between the policy and the router, so calls the policy denies never use up tokens. Each agent has a token bucket per tool. A call that finds its bucket empty gets error `-31029` and never reaches the upstream.
 - **`internal/fakeupstream`** is a small MCP server with `echo`, `add`, and `fail` tools, used in tests.
 
@@ -56,7 +57,7 @@ When an upstream doesn't reply, the client gets a JSON-RPC error (`-32603`) sayi
 | Auth | API keys per agent, stored hashed | Built |
 | Policy engine | YAML rules, default deny, argument checks like path prefixes and blocked SQL | Built |
 | Rate limiting | Token bucket per agent and per tool | Built |
-| Audit log | Append-only JSON in SQLite with redacted arguments | Planned |
+| Audit log | Append-only SQLite log of every tool call, with redacted arguments | Built |
 | Observability | Prometheus metrics and OpenTelemetry traces | Planned |
 | Resilience | Timeouts, circuit breakers, no automatic retries on tools with side effects | Timeouts built |
 | Description pinning | Hashes tool descriptions and quarantines a tool if its description changes | Planned |
@@ -85,7 +86,7 @@ internal/progress/      progress token rewriting and routing
 internal/auth/          API key identification
 internal/policy/        rules, argument checks, and the guard in front of the router
 internal/ratelimit/     per-agent, per-tool token buckets
-internal/audit/         append-only structured log (planned)
+internal/audit/         redaction, audit queue, SQLite store, and the audit layer
 internal/metrics/       Prometheus and OpenTelemetry (planned)
 internal/pinning/       tool description hashing and quarantine (planned)
 testdata/fakeupstream/  entry point for the fake server binary
@@ -114,10 +115,10 @@ make build    # builds bin/gateway
 ## Run
 
 ```sh
-gateway -config gateway.yaml -policy policy.yaml [-call-timeout 60s] [-log-level info]
-gateway -config gateway.yaml -policy policy.yaml -http 127.0.0.1:8080 [-allow-origin http://localhost:3000]...
-gateway -config gateway.yaml -policy policy.yaml -http 0.0.0.0:8443 -tls-cert cert.pem -tls-key key.pem
-gateway -config gateway.yaml -policy policy.yaml -http :8080 -behind-tls-proxy
+gateway -config gateway.yaml -policy policy.yaml -audit-db audit.db [-call-timeout 60s] [-log-level info]
+gateway -config gateway.yaml -policy policy.yaml -audit-db audit.db -http 127.0.0.1:8080 [-allow-origin http://localhost:3000]...
+gateway -config gateway.yaml -policy policy.yaml -audit-db audit.db -http 0.0.0.0:8443 -tls-cert cert.pem -tls-key key.pem
+gateway -config gateway.yaml -policy policy.yaml -audit-db audit.db -http :8080 -behind-tls-proxy
 gateway keygen -agent NAME
 ```
 
@@ -147,7 +148,7 @@ At least one agent is required. The file holds only the SHA-256 of each API key,
   ```json
   {"mcpServers": {"gateway": {
     "command": "/path/to/bin/gateway",
-    "args": ["-config", "/path/to/gateway.yaml", "-policy", "/path/to/policy.yaml"],
+    "args": ["-config", "/path/to/gateway.yaml", "-policy", "/path/to/policy.yaml", "-audit-db", "/path/to/audit.db"],
     "env": {"MCP_GATEWAY_API_KEY": "mcpgw_..."}
   }}}
   ```
@@ -207,7 +208,30 @@ Limits to know about:
 - Paths are checked as text. The gateway can't follow symlinks, because the files are on the upstream's side. `%2e%2e` isn't decoded, since the filesystem server won't decode it either.
 - A SQL blocklist is easy to get around: `DR/**/OP TABLE` splits the keyword with a comment and passes `\bdrop\b`. Use it as a guard rail only. The real protection is a database user that can only read.
 
-Commands run directly, not through a shell. Only the command is logged, since arguments can hold tokens. Exit codes: 0 for a normal stop, 1 if the config or policy is bad or an upstream fails or exits, 2 for a bad command line.
+### Audit log
+
+`-audit-db` is required. Every `tools/call` from an authenticated agent gets one row in a SQLite file, whatever happened to it: allowed, denied by the policy, rate limited, or failed upstream. A row has:
+
+- a request ID, the time (UTC), the agent, and the tool
+- the arguments, with secrets replaced by `[REDACTED]`
+- the decision (`allowed`, `denied`, `rate_limited`), the reason, and the rule or limit involved
+- how it ended (`ok`, `tool_error`, `rpc_error` with its code, or `no_response`) and the time spent upstream
+
+What the tool returned is never stored.
+
+Secrets are found two ways. Values under names like `password`, `token`, `apiKey`, or `authorization` are hidden whole. Strings shaped like known secrets (this gateway's keys, `Bearer` values, `sk-` keys, GitHub, AWS, and Slack tokens, private keys, and card numbers that pass the Luhn check) are hidden wherever they appear. A plain password under an innocent name like `note` can't be recognized and is stored as is.
+
+The table is append-only: SQLite triggers reject every `UPDATE` and `DELETE`.
+
+A call reserves room in the audit queue before it is checked or forwarded. If the database falls behind or fails, the queue fills, and after `-audit-wait` (default 100ms) new calls get `-32603 "audit log unavailable"` without running. A call never runs without a record. Failed writes are retried until they succeed. `-audit-queue` (default 1024) also caps how many tool calls can be in flight at once. On shutdown the gateway waits up to 10 seconds for the queue to be written.
+
+The file uses SQLite's WAL mode, so it can be read while the gateway runs:
+
+```sh
+sqlite3 bin/audit.db "SELECT time, agent, tool, decision, status FROM audit_log ORDER BY seq DESC LIMIT 10"
+```
+
+Commands run directly, not through a shell. Only the command is logged, since arguments can hold tokens. Exit codes: 0 for a normal stop, 1 if the config, policy, or audit log path is bad or an upstream fails or exits, 2 for a bad command line.
 
 To try it with the fake server and [`testdata/config/example-policy.yaml`](testdata/config/example-policy.yaml), which lets the agent `example` call `fake__echo`, `fake__add`, and `fake__count`:
 
@@ -217,7 +241,7 @@ go build -o bin/fakeupstream ./testdata/fakeupstream
 printf 'upstreams:\n  - name: fake\n    command: ./bin/fakeupstream\nagents:\n' > bin/my.yaml
 # The key goes into the variable; the agent lines are appended to the config.
 export MCP_GATEWAY_API_KEY="$(./bin/gateway keygen -agent example 2>>bin/my.yaml)"
-echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fake__add","arguments":{"a":2,"b":3},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}' | ./bin/gateway -config bin/my.yaml -policy testdata/config/example-policy.yaml
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fake__add","arguments":{"a":2,"b":3},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}' | ./bin/gateway -config bin/my.yaml -policy testdata/config/example-policy.yaml -audit-db bin/audit.db
 ```
 
 The reply on stdout includes `"structuredContent":{"sum":5}`. Log lines go to stderr. Change the tool to `fake__fail` and the reply is `Unknown tool: fake__fail`, with a `call denied` line in the log. `make run` starts the gateway with a fresh key and a policy that allows every fake tool, and lets you type requests in.
@@ -225,7 +249,7 @@ The reply on stdout includes `"structuredContent":{"sum":5}`. Log lines go to st
 Over HTTP:
 
 ```sh
-./bin/gateway -config bin/my.yaml -policy testdata/config/example-policy.yaml -http 127.0.0.1:8080 &
+./bin/gateway -config bin/my.yaml -policy testdata/config/example-policy.yaml -audit-db bin/audit.db -http 127.0.0.1:8080 &
 curl -s http://127.0.0.1:8080/mcp \
   -H "Authorization: Bearer $MCP_GATEWAY_API_KEY" \
   -H 'Content-Type: application/json' -H 'MCP-Protocol-Version: 2026-07-28' \

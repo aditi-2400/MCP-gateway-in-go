@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/audit/note"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/auth"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
 )
@@ -57,6 +58,7 @@ func (g *Guard) Call(ctx context.Context, method string, params json.RawMessage)
 		// Every transport authenticates before calling the guard, so this is
 		// a bug. Fail closed.
 		g.logger.Error("request has no agent; denying", "method", method)
+		note.Deny(ctx, "request has no agent")
 		return policyCheckFailed(), nil
 	}
 	switch method {
@@ -131,19 +133,23 @@ func (g *Guard) listTools(ctx context.Context, agent string, params json.RawMess
 func (g *Guard) callTool(ctx context.Context, agent string, params json.RawMessage) (*jsonrpc.Message, error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(params, &fields); err != nil {
+		note.Deny(ctx, "invalid tools/call params")
 		return &jsonrpc.Message{Error: &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: "invalid tools/call params"}}, nil
 	}
 	var name string
 	if err := json.Unmarshal(fields["name"], &name); err != nil || name == "" {
+		note.Deny(ctx, "tools/call has no tool name")
 		return &jsonrpc.Message{Error: &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: "tools/call needs a tool name"}}, nil
 	}
 
 	d := g.policy.AllowCall(agent, name, fields["arguments"])
 	if d.Allowed {
 		g.logger.Debug("call allowed", "agent", agent, "tool", name, "rule", d.Rule)
+		note.Allow(ctx, d.Reason, d.Rule)
 		return g.next.Call(ctx, "tools/call", params)
 	}
 	g.logger.Info("call denied", "agent", agent, "tool", name, "reason", d.Reason)
+	note.Deny(ctx, d.Reason)
 	if d.ArgProblem == "" {
 		return &jsonrpc.Message{Error: &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: "Unknown tool: " + name}}, nil
 	}

@@ -31,7 +31,7 @@ type gatewayProcess struct {
 
 func startGatewayProcess(t *testing.T, args ...string) *gatewayProcess {
 	t.Helper()
-	cmd := exec.Command(gatewayBin, withPolicy(args)...)
+	cmd := exec.Command(gatewayBin, withTestFiles(args)...)
 	// The last value wins, so this overrides any key in the real environment.
 	cmd.Env = append(os.Environ(), apiKeyEnv+"="+testAPIKey)
 	stderr := &syncBuffer{}

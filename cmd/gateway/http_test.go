@@ -377,7 +377,7 @@ func TestRunRejectsBadTLSFilesBeforeStartingAnything(t *testing.T) {
 	}
 	// syncBuffer, because upstream child processes also write to stderr.
 	stderr := &syncBuffer{}
-	err := run(context.Background(), withPolicy([]string{"-config", fakeConfig(t, "fake"), "-http", "127.0.0.1:0", "-tls-cert", bad, "-tls-key", bad}),
+	err := run(context.Background(), withTestFiles([]string{"-config", fakeConfig(t, "fake"), "-http", "127.0.0.1:0", "-tls-cert", bad, "-tls-key", bad}),
 		strings.NewReader(""), io.Discard, stderr, testEnv)
 	if err == nil || !strings.Contains(err.Error(), "TLS certificate") {
 		t.Fatalf("run() error = %v, want a TLS certificate error", err)

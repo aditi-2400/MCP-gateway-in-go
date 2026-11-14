@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/audit/note"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/auth"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
 )
@@ -279,5 +280,37 @@ func TestGuardToolSchema(t *testing.T) {
 	noSchemas := NewGuard(router, nil, g.policy, nil)
 	if _, _, err := noSchemas.ToolSchema(asAgent("bot"), "fs__write_file", nil); err == nil {
 		t.Error("guard without a schema source: error = nil, want one")
+	}
+}
+
+// The guard tells the audit log what it decided, through the note.
+func TestGuardNotesDecisions(t *testing.T) {
+	tests := []struct {
+		name     string
+		ctx      func() context.Context
+		params   string
+		decision note.Decision
+		reason   string // part of the reason
+		rule     string
+	}{
+		{name: "allowed", ctx: func() context.Context { return asAgent("bot") }, params: `{"name":"fs__read_file"}`, decision: note.Allowed, reason: "writer", rule: "writer: fs__read_file"},
+		{name: "tool denied", ctx: func() context.Context { return asAgent("bot") }, params: `{"name":"fs__delete"}`, decision: note.Denied, reason: "no role"},
+		{name: "args denied", ctx: func() context.Context { return asAgent("bot") }, params: `{"name":"fs__write_file","arguments":{"path":"/etc/x","content":"hi"}}`, decision: note.Denied, reason: "outside the allowed folders"},
+		{name: "bad params", ctx: func() context.Context { return asAgent("bot") }, params: `[1]`, decision: note.Denied, reason: "invalid tools/call params"},
+		{name: "no name", ctx: func() context.Context { return asAgent("bot") }, params: `{}`, decision: note.Denied, reason: "no tool name"},
+		{name: "no agent", ctx: context.Background, params: `{"name":"fs__read_file"}`, decision: note.Denied, reason: "no agent"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g, _ := newTestGuard(t)
+			ctx, n := note.New(tt.ctx())
+			if _, err := g.Call(ctx, "tools/call", json.RawMessage(tt.params)); err != nil {
+				t.Fatal(err)
+			}
+			got := n.Get()
+			if got.Decision != tt.decision || !strings.Contains(got.Reason, tt.reason) || got.Rule != tt.rule {
+				t.Errorf("note = %+v, want decision %q, reason with %q, rule %q", got, tt.decision, tt.reason, tt.rule)
+			}
+		})
 	}
 }

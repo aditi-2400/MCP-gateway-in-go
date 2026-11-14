@@ -149,7 +149,7 @@ func TestRunRefusesBadPolicyBeforeStartingAnything(t *testing.T) {
 				writePolicy(t, cfg, tt.policy)
 			}
 			stderr := &syncBuffer{}
-			err := run(context.Background(), withPolicy([]string{"-config", cfg}), strings.NewReader(""), io.Discard, stderr, testEnv)
+			err := run(context.Background(), withTestFiles([]string{"-config", cfg}), strings.NewReader(""), io.Discard, stderr, testEnv)
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) || !strings.Contains(err.Error(), policyPath) {
 				t.Fatalf("run() error = %v, want one naming %s and mentioning %q", err, policyPath, tt.wantErr)
 			}

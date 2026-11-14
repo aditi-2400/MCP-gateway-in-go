@@ -115,7 +115,7 @@ func startGateway(t *testing.T, ctx context.Context, args ...string) *gateway {
 	}
 
 	go func() {
-		g.done <- run(ctx, withPolicy(args), inR, outW, g.stderr, testEnv)
+		g.done <- run(ctx, withTestFiles(args), inR, outW, g.stderr, testEnv)
 		outW.Close()
 	}()
 	go func() {
@@ -216,14 +216,14 @@ func writeConfig(t *testing.T, upstreams ...upstreamEntry) string {
 	return path
 }
 
-// withPolicy adds -policy for the policy.yaml writeConfig put next to the
-// config, unless args already has a -policy or has no -config.
-func withPolicy(args []string) []string {
-	cfg := ""
+// withTestFiles adds -policy for the policy.yaml writeConfig put next to the
+// config, and -audit-db for an audit.db in the same folder, unless args
+// already has them or has no -config.
+func withTestFiles(args []string) []string {
+	cfg, hasPolicy, hasAudit := "", false, false
 	for i, a := range args {
-		if a == "-policy" || strings.HasPrefix(a, "-policy=") {
-			return args
-		}
+		hasPolicy = hasPolicy || a == "-policy" || strings.HasPrefix(a, "-policy=")
+		hasAudit = hasAudit || a == "-audit-db" || strings.HasPrefix(a, "-audit-db=")
 		if a == "-config" && i+1 < len(args) {
 			cfg = args[i+1]
 		}
@@ -231,7 +231,19 @@ func withPolicy(args []string) []string {
 	if cfg == "" {
 		return args
 	}
-	return append(slices.Clone(args), "-policy", filepath.Join(filepath.Dir(cfg), "policy.yaml"))
+	out := slices.Clone(args)
+	if !hasPolicy {
+		out = append(out, "-policy", filepath.Join(filepath.Dir(cfg), "policy.yaml"))
+	}
+	if !hasAudit {
+		out = append(out, "-audit-db", auditDBFor(cfg))
+	}
+	return out
+}
+
+// auditDBFor is where withTestFiles puts the audit log for a test config.
+func auditDBFor(cfg string) string {
+	return filepath.Join(filepath.Dir(cfg), "audit.db")
 }
 
 func fakeConfig(t *testing.T, names ...string) string {
@@ -327,7 +339,7 @@ func TestRunRefusesToStartWhenAnUpstreamFails(t *testing.T) {
 		upstreamEntry{name: "good", command: fakeUpstreamBin},
 		upstreamEntry{name: "broken", command: missing},
 	)
-	err := run(context.Background(), withPolicy([]string{"-config", cfg}), strings.NewReader(""), io.Discard, io.Discard, testEnv)
+	err := run(context.Background(), withTestFiles([]string{"-config", cfg}), strings.NewReader(""), io.Discard, io.Discard, testEnv)
 	if err == nil || !strings.Contains(err.Error(), `"broken"`) {
 		t.Fatalf("run() error = %v, want an error naming \"broken\"", err)
 	}
@@ -340,7 +352,7 @@ func TestRunRejectsBadConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, path := range []string{missing, bad} {
-		err := run(context.Background(), withPolicy([]string{"-config", path}), strings.NewReader(""), io.Discard, io.Discard, testEnv)
+		err := run(context.Background(), withTestFiles([]string{"-config", path}), strings.NewReader(""), io.Discard, io.Discard, testEnv)
 		if err == nil || errors.Is(err, errUsage) || !strings.Contains(err.Error(), path) {
 			t.Errorf("run(%s) error = %v, want a config error naming the file", path, err)
 		}
@@ -369,43 +381,46 @@ func TestParseFlags(t *testing.T) {
 		wantHTTP    string
 		wantOrigins string
 	}{
-		{name: "config only", args: []string{"-config", "g.yaml", "-policy", "p.yaml"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second},
-		{name: "config with equals", args: []string{"-config=g.yaml", "-policy=p.yaml"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second},
-		{name: "timeout flag", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-call-timeout", "2s"}, wantConfig: "g.yaml", wantTimeout: 2 * time.Second},
-		{name: "log level flag", args: []string{"-log-level", "debug", "-config", "g.yaml", "-policy", "p.yaml"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second},
+		{name: "config only", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second},
+		{name: "config with equals", args: []string{"-config=g.yaml", "-policy=p.yaml", "-audit-db=a.db"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second},
+		{name: "timeout flag", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-call-timeout", "2s"}, wantConfig: "g.yaml", wantTimeout: 2 * time.Second},
+		{name: "log level flag", args: []string{"-log-level", "debug", "-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second},
 		{name: "missing config", args: nil, wantErr: errUsage},
 		{name: "empty config", args: []string{"-config", ""}, wantErr: errUsage},
 		{name: "missing policy", args: []string{"-config", "g.yaml"}, wantErr: errUsage},
 		{name: "empty policy", args: []string{"-config", "g.yaml", "-policy", ""}, wantErr: errUsage},
+		{name: "missing audit db", args: []string{"-config", "g.yaml", "-policy", "p.yaml"}, wantErr: errUsage},
+		{name: "zero audit queue", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-audit-queue", "0"}, wantErr: errUsage},
+		{name: "zero audit wait", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-audit-wait", "0s"}, wantErr: errUsage},
 		{name: "old command form", args: []string{"--", "server"}, wantErr: errUsage},
-		{name: "extra arguments", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "server"}, wantErr: errUsage},
-		{name: "zero timeout", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-call-timeout", "0s"}, wantErr: errUsage},
-		{name: "negative timeout", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-call-timeout", "-1s"}, wantErr: errUsage},
-		{name: "bad timeout", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-call-timeout", "soon"}, wantErr: errUsage},
-		{name: "bad log level", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-log-level", "loud"}, wantErr: errUsage},
-		{name: "unknown flag", args: []string{"-nope", "-config", "g.yaml", "-policy", "p.yaml"}, wantErr: errUsage},
+		{name: "extra arguments", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "server"}, wantErr: errUsage},
+		{name: "zero timeout", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-call-timeout", "0s"}, wantErr: errUsage},
+		{name: "negative timeout", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-call-timeout", "-1s"}, wantErr: errUsage},
+		{name: "bad timeout", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-call-timeout", "soon"}, wantErr: errUsage},
+		{name: "bad log level", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-log-level", "loud"}, wantErr: errUsage},
+		{name: "unknown flag", args: []string{"-nope", "-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db"}, wantErr: errUsage},
 		{name: "help", args: []string{"-h"}, wantErr: flag.ErrHelp},
-		{name: "http on 127.0.0.1", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-http", "127.0.0.1:8080"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "127.0.0.1:8080"},
-		{name: "http on ::1", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-http", "[::1]:0"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "[::1]:0"},
-		{name: "http on localhost", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-http", "localhost:0"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "localhost:0"},
-		{name: "http on 127.0.0.2", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-http", "127.0.0.2:80"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "127.0.0.2:80"},
-		{name: "origins with http", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-http", "127.0.0.1:0", "-allow-origin", "http://a", "-allow-origin", "http://b"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "127.0.0.1:0", wantOrigins: "http://a,http://b"},
-		{name: "http on all interfaces", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-http", ":8080"}, wantErr: errUsage},
-		{name: "http on 0.0.0.0", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-http", "0.0.0.0:8080"}, wantErr: errUsage},
-		{name: "http on [::]", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-http", "[::]:8080"}, wantErr: errUsage},
-		{name: "http on a LAN address", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-http", "192.168.1.10:8080"}, wantErr: errUsage},
-		{name: "http on a hostname", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-http", "example.com:8080"}, wantErr: errUsage},
-		{name: "http without port", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-http", "127.0.0.1"}, wantErr: errUsage},
-		{name: "origins without http", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-allow-origin", "http://a"}, wantErr: errUsage},
-		{name: "all interfaces with TLS", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-http", "0.0.0.0:8443", "-tls-cert", "c.pem", "-tls-key", "k.pem"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "0.0.0.0:8443"},
-		{name: "LAN address with TLS", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-http", "192.168.1.10:8443", "-tls-cert", "c.pem", "-tls-key", "k.pem"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "192.168.1.10:8443"},
-		{name: "all interfaces behind a TLS proxy", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-http", ":8080", "-behind-tls-proxy"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: ":8080"},
-		{name: "loopback with TLS", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-http", "127.0.0.1:8443", "-tls-cert", "c.pem", "-tls-key", "k.pem"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "127.0.0.1:8443"},
-		{name: "cert without key", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-http", "0.0.0.0:8443", "-tls-cert", "c.pem"}, wantErr: errUsage},
-		{name: "key without cert", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-http", "0.0.0.0:8443", "-tls-key", "k.pem"}, wantErr: errUsage},
-		{name: "TLS and proxy together", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-http", "0.0.0.0:8443", "-tls-cert", "c.pem", "-tls-key", "k.pem", "-behind-tls-proxy"}, wantErr: errUsage},
-		{name: "TLS without http", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-tls-cert", "c.pem", "-tls-key", "k.pem"}, wantErr: errUsage},
-		{name: "proxy flag without http", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-behind-tls-proxy"}, wantErr: errUsage},
+		{name: "http on 127.0.0.1", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-http", "127.0.0.1:8080"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "127.0.0.1:8080"},
+		{name: "http on ::1", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-http", "[::1]:0"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "[::1]:0"},
+		{name: "http on localhost", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-http", "localhost:0"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "localhost:0"},
+		{name: "http on 127.0.0.2", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-http", "127.0.0.2:80"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "127.0.0.2:80"},
+		{name: "origins with http", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-http", "127.0.0.1:0", "-allow-origin", "http://a", "-allow-origin", "http://b"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "127.0.0.1:0", wantOrigins: "http://a,http://b"},
+		{name: "http on all interfaces", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-http", ":8080"}, wantErr: errUsage},
+		{name: "http on 0.0.0.0", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-http", "0.0.0.0:8080"}, wantErr: errUsage},
+		{name: "http on [::]", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-http", "[::]:8080"}, wantErr: errUsage},
+		{name: "http on a LAN address", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-http", "192.168.1.10:8080"}, wantErr: errUsage},
+		{name: "http on a hostname", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-http", "example.com:8080"}, wantErr: errUsage},
+		{name: "http without port", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-http", "127.0.0.1"}, wantErr: errUsage},
+		{name: "origins without http", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-allow-origin", "http://a"}, wantErr: errUsage},
+		{name: "all interfaces with TLS", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-http", "0.0.0.0:8443", "-tls-cert", "c.pem", "-tls-key", "k.pem"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "0.0.0.0:8443"},
+		{name: "LAN address with TLS", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-http", "192.168.1.10:8443", "-tls-cert", "c.pem", "-tls-key", "k.pem"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "192.168.1.10:8443"},
+		{name: "all interfaces behind a TLS proxy", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-http", ":8080", "-behind-tls-proxy"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: ":8080"},
+		{name: "loopback with TLS", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-http", "127.0.0.1:8443", "-tls-cert", "c.pem", "-tls-key", "k.pem"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "127.0.0.1:8443"},
+		{name: "cert without key", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-http", "0.0.0.0:8443", "-tls-cert", "c.pem"}, wantErr: errUsage},
+		{name: "key without cert", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-http", "0.0.0.0:8443", "-tls-key", "k.pem"}, wantErr: errUsage},
+		{name: "TLS and proxy together", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-http", "0.0.0.0:8443", "-tls-cert", "c.pem", "-tls-key", "k.pem", "-behind-tls-proxy"}, wantErr: errUsage},
+		{name: "TLS without http", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-tls-cert", "c.pem", "-tls-key", "k.pem"}, wantErr: errUsage},
+		{name: "proxy flag without http", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-behind-tls-proxy"}, wantErr: errUsage},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

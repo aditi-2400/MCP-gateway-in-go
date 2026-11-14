@@ -3,9 +3,11 @@ package ratelimit
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"time"
 
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/audit/note"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/auth"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
 )
@@ -59,6 +61,7 @@ func (e *Enforcer) Call(ctx context.Context, method string, params json.RawMessa
 		// The transports always attach an agent, so this is a bug. Without
 		// an agent there is no bucket to count against: fail closed.
 		e.logger.Error("tools/call has no agent; denying")
+		note.Deny(ctx, "request has no agent")
 		return &jsonrpc.Message{Error: &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: "rate limit check failed"}}, nil
 	}
 	var p struct {
@@ -74,6 +77,7 @@ func (e *Enforcer) Call(ctx context.Context, method string, params json.RawMessa
 		return e.next.Call(ctx, method, params)
 	}
 	e.logger.Info("call rate limited", "agent", agent.Name, "tool", p.Name, "limit", lim.String(), "entry", entry, "retry_after", retry)
+	note.Limit(ctx, fmt.Sprintf("rate limit %s; retry in %v", lim, retry), entry)
 	return rateLimited(p.Name, retry)
 }
 

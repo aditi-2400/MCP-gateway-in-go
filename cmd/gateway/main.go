@@ -31,6 +31,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/audit"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/auth"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/config"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
@@ -49,6 +50,10 @@ var errUsage = errors.New("usage error")
 // errUpstreamExited means an upstream server stopped while the client was
 // still connected.
 var errUpstreamExited = errors.New("upstream server exited")
+
+// auditFlushTimeout bounds how long shutdown waits for audit entries to be
+// written.
+const auditFlushTimeout = 10 * time.Second
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -69,6 +74,9 @@ func main() {
 type flags struct {
 	configPath     string
 	policyPath     string
+	auditDB        string
+	auditQueue     int
+	auditWait      time.Duration
 	callTimeout    time.Duration
 	logLevel       slog.Level
 	httpAddr       string // empty means stdio
@@ -99,6 +107,9 @@ func parseFlags(args []string, stderr io.Writer) (flags, error) {
 	f := flags{logLevel: slog.LevelInfo}
 	fs.StringVar(&f.configPath, "config", "", "path to the YAML config file listing upstream servers (required)")
 	fs.StringVar(&f.policyPath, "policy", "", "path to the YAML policy file saying which agent may call which tool (required)")
+	fs.StringVar(&f.auditDB, "audit-db", "", "path to the SQLite audit log, created if missing (required)")
+	fs.IntVar(&f.auditQueue, "audit-queue", audit.DefaultQueueSize, "most tool calls in flight plus audit entries not yet written")
+	fs.DurationVar(&f.auditWait, "audit-wait", audit.DefaultReserveWait, "how long a tool call waits for room in the audit queue before it is refused")
 	fs.DurationVar(&f.callTimeout, "call-timeout", proxy.DefaultCallTimeout, "how long each request may wait for the upstreams")
 	fs.TextVar(&f.logLevel, "log-level", f.logLevel, "log level: debug, info, warn, or error")
 	fs.StringVar(&f.httpAddr, "http", "", "serve Streamable HTTP on this address (e.g. 127.0.0.1:8080) in place of stdio; non-loopback addresses need TLS or -behind-tls-proxy")
@@ -118,6 +129,15 @@ func parseFlags(args []string, stderr io.Writer) (flags, error) {
 	}
 	if f.policyPath == "" {
 		return flags{}, usageFailure(fs, "missing -policy; every call is checked against a policy file")
+	}
+	if f.auditDB == "" {
+		return flags{}, usageFailure(fs, "missing -audit-db; every tool call is recorded")
+	}
+	if f.auditQueue <= 0 {
+		return flags{}, usageFailure(fs, "-audit-queue must be positive")
+	}
+	if f.auditWait <= 0 {
+		return flags{}, usageFailure(fs, "-audit-wait must be positive")
 	}
 	if fs.NArg() > 0 {
 		return flags{}, usageFailure(fs, "unexpected arguments; upstreams are listed in the -config file")
@@ -181,6 +201,22 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		ctx = auth.WithAgent(ctx, agent)
 	}
 
+	// Opened before upstreams start, so a bad path stops startup early.
+	store, err := audit.OpenSQLite(ctx, f.auditDB)
+	if err != nil {
+		return err
+	}
+	recorder := audit.NewRecorder(store, audit.Options{
+		QueueSize:   f.auditQueue,
+		ReserveWait: f.auditWait,
+		Logger:      logger.With("component", "audit"),
+	})
+	closeAudit := func() error {
+		flushCtx, cancel := context.WithTimeout(context.Background(), auditFlushTimeout)
+		defer cancel()
+		return errors.Join(recorder.Close(flushCtx), store.Close())
+	}
+
 	// Upstream read loops start inside StartGroup, but the proxy can only be
 	// built after it. Notifications that arrive before the proxy exists are
 	// dropped, the same as when no client is connected.
@@ -205,7 +241,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		Stderr:         stderr,
 	})
 	if err != nil {
-		return err
+		return errors.Join(err, closeAudit())
 	}
 	for _, u := range cfg.Upstreams {
 		// Only the command is logged. Arguments can hold tokens.
@@ -214,13 +250,17 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 
 	rt, err := router.New(routes(group), router.Options{Logger: logger.With("component", "router")})
 	if err != nil {
-		return errors.Join(err, group.Close())
+		return errors.Join(err, closeAudit(), group.Close())
 	}
-	// Requests go guard, then rate limit, then router: calls the policy
-	// denies never use up an agent's tokens.
-	limited := ratelimit.NewEnforcer(rt, pol, ratelimit.New(time.Now), logger.With("component", "ratelimit"))
+	// A request passes audit, policy, rate limit, the upstream timer, then the
+	// router. Audit comes first so even refused calls are recorded, and a
+	// call that can't be recorded is refused before anything else. The
+	// policy runs before the rate limit, so denied calls use up no tokens.
+	timed := audit.TimeUpstream(rt)
+	limited := ratelimit.NewEnforcer(timed, pol, ratelimit.New(time.Now), logger.With("component", "ratelimit"))
 	guard := policy.NewGuard(limited, rt, pol, logger.With("component", "policy"))
-	p := proxy.New(guard, proxy.Options{
+	audited := audit.NewLayer(guard, recorder, logger.With("component", "audit"))
+	p := proxy.New(audited, proxy.Options{
 		CallTimeout: f.callTimeout,
 		Logger:      logger.With("component", "proxy"),
 		Progress:    tracker,
@@ -229,7 +269,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 
 	var serveErr error
 	if f.httpAddr != "" {
-		serveErr = serveHTTP(ctx, guard, authn, tracker, group, f, tlsConfig, logger)
+		serveErr = serveHTTP(ctx, audited, guard, authn, tracker, group, f, tlsConfig, logger)
 	} else {
 		serveErr = serve(ctx, p, group, stdin, stdout)
 	}
@@ -239,12 +279,18 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		serveErr = nil
 	}
 
+	// Every call has finished, so flush the audit log before stopping
+	// upstreams, in case stopping them hangs.
+	auditErr := closeAudit()
+	if auditErr != nil {
+		logger.Error("audit log shutdown", "error", auditErr)
+	}
 	closeErr := group.Close()
 	if closeErr != nil {
 		logger.Warn("upstream shutdown", "error", closeErr)
 	}
 	logger.Info("gateway stopped")
-	return errors.Join(serveErr, closeErr)
+	return errors.Join(serveErr, auditErr, closeErr)
 }
 
 // loadPolicy reads the policy and checks it against the config, so a rule
