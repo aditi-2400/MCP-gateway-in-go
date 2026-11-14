@@ -83,6 +83,10 @@ type Decision struct {
 	Rule string
 	// Reason explains the decision in words, for logs.
 	Reason string
+	// ArgProblem is set when a rule allows the tool but the arguments
+	// failed its checks. It is safe to show the agent: it names the argument
+	// and the kind of problem, never roles, folders, patterns, or values.
+	ArgProblem string
 }
 
 // Load reads and validates the policy file at path.
@@ -293,10 +297,11 @@ func (p *Policy) AllowCall(agent, tool string, arguments json.RawMessage) Decisi
 		return Decision{Reason: fmt.Sprintf("agent %q is not in the policy", agent)}
 	}
 	var (
-		args     map[string]json.RawMessage
-		parseErr error
-		parsed   bool
-		failures []string
+		args       map[string]json.RawMessage
+		parseErr   error
+		parsed     bool
+		failures   []string
+		argProblem string
 	)
 	for _, roleName := range roles {
 		for _, rule := range p.Roles[roleName].Allow {
@@ -318,14 +323,32 @@ func (p *Policy) AllowCall(agent, tool string, arguments json.RawMessage) Decisi
 			if err == nil {
 				return allowed(roleName, rule)
 			}
-			failures = append(failures, fmt.Sprintf("role %q rule %s: %v", roleName, rule.Tool, err))
+			if argProblem == "" {
+				argProblem = err.Error()
+			}
+			failure := fmt.Sprintf("role %q rule %s: %v", roleName, rule.Tool, err)
+			if ae, ok := errors.AsType[*argError](err); ok && ae.detail != "" {
+				failure += " (" + ae.detail + ")"
+			}
+			failures = append(failures, failure)
 		}
 	}
 	if len(failures) == 0 {
 		return Decision{Reason: fmt.Sprintf("no role of agent %q allows tool %q", agent, tool)}
 	}
-	return Decision{Reason: strings.Join(failures, "; ")}
+	return Decision{Reason: strings.Join(failures, "; "), ArgProblem: argProblem}
 }
+
+// argError is an argument check failure. Error() is safe to show the agent;
+// detail adds what only the operator should see, like which deny pattern
+// matched. Telling the agent the pattern would show it how to write around
+// the blocklist.
+type argError struct {
+	msg    string
+	detail string
+}
+
+func (e *argError) Error() string { return e.msg }
 
 func allowed(roleName string, rule Rule) Decision {
 	return Decision{
@@ -410,7 +433,8 @@ func checkArgs(rules map[string]ArgRule, args map[string]json.RawMessage) error 
 	return nil
 }
 
-// check tests one value. Errors finish the sentence "argument X ...".
+// check tests one value. Errors finish the sentence "argument X ...", and
+// like every argument error they are shown to the agent.
 func (r ArgRule) check(value json.RawMessage) error {
 	var s string
 	isString := len(value) > 0 && value[0] == '"' && json.Unmarshal(value, &s) == nil
@@ -433,9 +457,11 @@ func (r ArgRule) check(value json.RawMessage) error {
 			return err
 		}
 	}
-	for _, re := range r.denyRegexps {
+	// denyRegexps lines up with DenyPatterns, since a policy with a pattern
+	// that does not compile never loads.
+	for i, re := range r.denyRegexps {
 		if re.MatchString(s) {
-			return fmt.Errorf("matches denied pattern %q", re.String())
+			return &argError{msg: "matches a denied pattern", detail: fmt.Sprintf("deny_patterns[%d]", i)}
 		}
 	}
 	return nil

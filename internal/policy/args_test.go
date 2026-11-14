@@ -161,6 +161,51 @@ func TestAllowCallReasonsHideValues(t *testing.T) {
 	}
 }
 
+// ArgProblem is shown to the agent, so it must say what to fix without
+// revealing the policy: no roles, folders, or patterns.
+func TestAllowCallArgProblem(t *testing.T) {
+	p := mustParse(t, argsPolicy)
+	tests := []struct {
+		name        string
+		agent, tool string
+		args        string
+		want        string // the exact ArgProblem
+		logOnly     string // in Reason, never in ArgProblem
+	}{
+		{name: "path outside", agent: "bot", tool: "fs__write_file", args: `{"path":"/etc/x","content":"hi"}`, want: `argument "path" is outside the allowed folders`, logOnly: "writer"},
+		{name: "pattern", agent: "bot", tool: "db__query", args: `{"sql":"DROP TABLE t"}`, want: `argument "sql" matches a denied pattern`, logOnly: "deny_patterns[0]"},
+		{name: "second pattern", agent: "bot", tool: "db__query", args: `{"sql":"truncate t"}`, want: `argument "sql" matches a denied pattern`, logOnly: "deny_patterns[1]"},
+		{name: "bad shape", agent: "bot", tool: "fs__write_file", args: `[1]`, want: "arguments must be an object", logOnly: "writer"},
+		{name: "first failing role wins", agent: "both", tool: "fs__write_file", args: `{"path":"/etc/x","content":"hi"}`, want: `argument "path" is outside the allowed folders`, logOnly: "other-writer"},
+		{name: "tool not allowed", agent: "bot", tool: "fs__delete", args: `{}`, want: ""},
+		{name: "agent not in policy", agent: "stranger", tool: "fs__write_file", args: `{}`, want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := p.AllowCall(tt.agent, tt.tool, json.RawMessage(tt.args))
+			if d.Allowed {
+				t.Fatal("allowed, want denied")
+			}
+			if d.ArgProblem != tt.want {
+				t.Errorf("ArgProblem = %q, want %q", d.ArgProblem, tt.want)
+			}
+			if tt.logOnly != "" {
+				if !strings.Contains(d.Reason, tt.logOnly) {
+					t.Errorf("Reason %q does not mention %q", d.Reason, tt.logOnly)
+				}
+				if strings.Contains(d.ArgProblem, tt.logOnly) {
+					t.Errorf("ArgProblem %q reveals %q", d.ArgProblem, tt.logOnly)
+				}
+			}
+			for _, secret := range []string{"/tmp", "/srv", "drop", "truncate"} {
+				if strings.Contains(strings.ToLower(d.ArgProblem), secret) {
+					t.Errorf("ArgProblem %q reveals the policy (%q)", d.ArgProblem, secret)
+				}
+			}
+		})
+	}
+}
+
 // tools/list shows a tool when some rule names it, whatever its argument
 // checks; the checks run on the call.
 func TestAllowToolIgnoresArgChecks(t *testing.T) {
