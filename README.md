@@ -97,7 +97,10 @@ The fake server's logic lives in `internal/fakeupstream` so that `go test ./...`
 
 - Go 1.26 or newer
 
-Dependencies are tracked in `go.mod`. The only one so far is [`go.yaml.in/yaml/v4`](https://pkg.go.dev/go.yaml.in/yaml/v4) for the config file, since Go's standard library has no YAML parser. It is the YAML organization's maintained version of go-yaml. The older `gopkg.in/yaml.v3` was marked unmaintained in 2025.
+Dependencies are tracked in `go.mod`. There are two:
+
+- [`go.yaml.in/yaml/v4`](https://pkg.go.dev/go.yaml.in/yaml/v4) for the config and policy files, since Go's standard library has no YAML parser. It is the YAML organization's maintained version of go-yaml. The older `gopkg.in/yaml.v3` was marked unmaintained in 2025.
+- [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite) for the audit log. It is SQLite translated to Go, so builds need no C compiler. It is slower than the C version, which doesn't matter for a log written in the background. It brings in its own set of `modernc.org` packages.
 
 ## Build and test
 
