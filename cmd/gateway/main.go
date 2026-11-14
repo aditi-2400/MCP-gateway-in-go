@@ -7,6 +7,7 @@
 //	gateway -config gateway.yaml -policy policy.yaml [-call-timeout 60s] [-log-level info]
 //	gateway -config gateway.yaml -policy policy.yaml -http 127.0.0.1:8080 [-allow-origin URL]...
 //	gateway keygen -agent NAME
+//	gateway audit -db audit.db [-agent NAME] [-tool NAME] [-decision D] [-since 1h] [-json]
 //
 // Every caller needs an API key from keygen. Over stdio it goes in the
 // MCP_GATEWAY_API_KEY environment variable; over HTTP, in an
@@ -167,6 +168,9 @@ func usageFailure(fs *flag.FlagSet, msg string) error {
 func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(string) string) error {
 	if len(args) > 0 && args[0] == "keygen" {
 		return runKeygen(args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "audit" {
+		return runAudit(ctx, args[1:], stdout, stderr)
 	}
 	f, err := parseFlags(args, stderr)
 	if err != nil {

@@ -120,6 +120,7 @@ gateway -config gateway.yaml -policy policy.yaml -audit-db audit.db -http 127.0.
 gateway -config gateway.yaml -policy policy.yaml -audit-db audit.db -http 0.0.0.0:8443 -tls-cert cert.pem -tls-key key.pem
 gateway -config gateway.yaml -policy policy.yaml -audit-db audit.db -http :8080 -behind-tls-proxy
 gateway keygen -agent NAME
+gateway audit -db audit.db [-agent NAME] [-tool NAME] [-decision D] [-since 1h] [-limit N] [-json]
 ```
 
 Without `-http`, the gateway speaks MCP over stdin and stdout. With it, the gateway serves `POST /mcp` and doesn't read stdin. On a loopback address (`127.0.0.1`, `::1`, `localhost`) plain HTTP is fine. Any other address needs encryption, because every request carries an API key: either `-tls-cert` and `-tls-key` (HTTPS, TLS 1.2 or newer), or `-behind-tls-proxy` when nginx, Caddy, or a load balancer in front handles HTTPS. Without one of those the gateway refuses to start. Browsers send an `Origin` header, and only origins listed with `-allow-origin` are accepted; requests without `Origin` (curl, SDKs, agents) are fine.
@@ -225,11 +226,16 @@ The table is append-only: SQLite triggers reject every `UPDATE` and `DELETE`.
 
 A call reserves room in the audit queue before it is checked or forwarded. If the database falls behind or fails, the queue fills, and after `-audit-wait` (default 100ms) new calls get `-32603 "audit log unavailable"` without running. A call never runs without a record. Failed writes are retried until they succeed. `-audit-queue` (default 1024) also caps how many tool calls can be in flight at once. On shutdown the gateway waits up to 10 seconds for the queue to be written.
 
-The file uses SQLite's WAL mode, so it can be read while the gateway runs:
+To read it, even while the gateway runs:
 
 ```sh
-sqlite3 bin/audit.db "SELECT time, agent, tool, decision, status FROM audit_log ORDER BY seq DESC LIMIT 10"
+gateway audit -db bin/audit.db                                  # newest 50 rows, oldest first
+gateway audit -db bin/audit.db -agent ci-bot -since 1h
+gateway audit -db bin/audit.db -tool 'github__*' -decision denied
+gateway audit -db bin/audit.db -limit 1000 -json | jq .          # one JSON object per line
 ```
+
+`-since` takes a duration (`30m`, `2h`) or a time (`2026-11-14T10:00:00Z`). `gateway audit` opens the file read-only and never creates it. In the table, control characters in agent-supplied text (tool names, reasons, arguments) are shown escaped, like `\u001b`, so a crafted tool name can't send escape codes to your terminal. Long arguments are cut short in the table; `-json` shows them whole.
 
 Commands run directly, not through a shell. Only the command is logged, since arguments can hold tokens. Exit codes: 0 for a normal stop, 1 if the config, policy, or audit log path is bad or an upstream fails or exits, 2 for a bad command line.
 
