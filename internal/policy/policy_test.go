@@ -21,6 +21,8 @@ agents:
   ci-bot: [readers]
   analyst: [readers, db-readers]
   idle: []
+limits:
+  default: { rate: 60/minute, burst: 10 }
 `
 
 func mustParse(t *testing.T, text string) *Policy {

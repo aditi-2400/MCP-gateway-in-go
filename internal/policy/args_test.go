@@ -32,6 +32,8 @@ agents:
   bot: [writer]
   both: [writer, other-writer]
   pinger: [no-args]
+limits:
+  default: { rate: 60/minute, burst: 10 }
 `
 
 func TestAllowCall(t *testing.T) {

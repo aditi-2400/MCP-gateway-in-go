@@ -176,6 +176,16 @@ roles:
 agents:
   ci-bot: [reader]
   analyst: [reader, writer]
+
+limits:
+  default: { rate: 60/minute, burst: 10 }   # every tool without its own entry
+  tools:
+    - tool: db__query
+      rate: 5/minute
+      burst: 2
+    - tool: github__*
+      rate: 100/minute
+      burst: 20
 ```
 
 - An agent sees only the tools it may call in `tools/list`. A call to any other tool gets the same `Unknown tool` error as a tool that doesn't exist, so agents can't probe for hidden tools.
@@ -185,6 +195,7 @@ agents:
 - `deny_patterns` are Go regular expressions, always matched without regard to case. `max_length` counts bytes.
 - Arguments with a repeated key or invalid UTF-8 are denied, so the gateway can't check one value while the upstream reads another.
 - When arguments fail a check, the agent gets a tool result with `isError: true`, like `Denied by gateway policy: argument "path" is outside the allowed folders`. The spec says clients should show these to the model, so it can try again. The message never includes the folders, the patterns, or the argument's value. The log line names the agent, the tool, the role, and which pattern matched.
+- `limits:` is required and needs a `default`, so no tool is ever unlimited. Each agent gets its own token bucket for each tool: `burst` calls can come at once, and `rate` says how fast they come back. An exact tool entry wins over `upstream__*`, which wins over `default`. With `github__*`, each GitHub tool is counted on its own. Limits are checked when the file loads; the gateway starts enforcing them in the next step.
 - If the policy file is missing, invalid, or names an upstream or agent the config doesn't have, the gateway refuses to start. If the guard can't check something, the call is denied.
 
 Limits to know about:

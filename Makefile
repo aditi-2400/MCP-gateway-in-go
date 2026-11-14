@@ -37,7 +37,7 @@ check: fmt-check vet test
 run: build
 	go build -o $(BIN_DIR)/fakeupstream ./testdata/fakeupstream
 	@printf 'upstreams:\n  - name: fake\n    command: ./bin/fakeupstream\nagents:\n' > $(BIN_DIR)/run.yaml
-	@printf 'roles:\n  all:\n    allow:\n      - tool: fake__*\nagents:\n  dev: [all]\n' > $(BIN_DIR)/run-policy.yaml
+	@printf 'roles:\n  all:\n    allow:\n      - tool: fake__*\nagents:\n  dev: [all]\nlimits:\n  default: { rate: 60/minute, burst: 10 }\n' > $(BIN_DIR)/run-policy.yaml
 	@MCP_GATEWAY_API_KEY="$$($(GATEWAY) keygen -agent dev 2>>$(BIN_DIR)/run.yaml)" $(GATEWAY) -config $(BIN_DIR)/run.yaml -policy $(BIN_DIR)/run-policy.yaml
 
 clean:

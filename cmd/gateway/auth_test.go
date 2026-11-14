@@ -196,7 +196,7 @@ func TestBinaryKeygenThenConnect(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	policyText := "roles:\n  all:\n    allow:\n      - tool: fake__*\nagents:\n  desktop: [all]\n"
+	policyText := "roles:\n  all:\n    allow:\n      - tool: fake__*\nagents:\n  desktop: [all]\nlimits:\n  default: { rate: 60/minute, burst: 10 }\n"
 	policyPath := filepath.Join(filepath.Dir(path), "policy.yaml")
 	if err := os.WriteFile(policyPath, []byte(policyText), 0o600); err != nil {
 		t.Fatal(err)

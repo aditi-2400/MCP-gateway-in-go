@@ -39,6 +39,7 @@ const wildcard = "*"
 type Policy struct {
 	Roles  map[string]Role     `yaml:"roles"`
 	Agents map[string][]string `yaml:"agents"` // agent -> role names
+	Limits *Limits             `yaml:"limits"`
 }
 
 // Role is a named set of rules.
@@ -154,6 +155,7 @@ func (p *Policy) validate() error {
 			seen[role] = true
 		}
 	}
+	errs = append(errs, p.validateLimits()...)
 	return errors.Join(errs...)
 }
 
@@ -264,6 +266,7 @@ func (p *Policy) CheckNames(upstreams, agents []string) error {
 			errs = append(errs, fmt.Errorf("agent %q is in the policy but has no key in the config", agent))
 		}
 	}
+	errs = append(errs, p.checkLimitNames(upstreams)...)
 	return errors.Join(errs...)
 }
 

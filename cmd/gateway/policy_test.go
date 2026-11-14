@@ -24,6 +24,8 @@ roles:
           text: { max_length: 10 }
 agents:
   tester: [echoer]
+limits:
+  default: { rate: 1000/second, burst: 1000 }
 `
 
 // writePolicy replaces the policy writeConfig put next to cfg.
@@ -132,8 +134,8 @@ func TestRunRefusesBadPolicyBeforeStartingAnything(t *testing.T) {
 	}{
 		{name: "missing file", wantErr: "policy"},
 		{name: "invalid policy", policy: "roles: {}\n", wantErr: "no agents"},
-		{name: "unknown upstream", policy: "roles:\n  r:\n    allow:\n      - tool: alhpa__echo\nagents:\n  tester: [r]\n", wantErr: `upstream "alhpa"`},
-		{name: "agent without a key", policy: "roles:\n  r:\n    allow:\n      - tool: alpha__echo\nagents:\n  ghost: [r]\n", wantErr: `"ghost"`},
+		{name: "unknown upstream", policy: "roles:\n  r:\n    allow:\n      - tool: alhpa__echo\nagents:\n  tester: [r]\nlimits:\n  default: { rate: 5/second, burst: 5 }\n", wantErr: `upstream "alhpa"`},
+		{name: "agent without a key", policy: "roles:\n  r:\n    allow:\n      - tool: alpha__echo\nagents:\n  ghost: [r]\nlimits:\n  default: { rate: 5/second, burst: 5 }\n", wantErr: `"ghost"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

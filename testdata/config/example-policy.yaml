@@ -20,3 +20,12 @@ roles:
 
 agents:
   example: [basic]
+
+# Each agent gets its own bucket per tool. Every tool without its own entry
+# uses the default, so nothing is unlimited.
+limits:
+  default: { rate: 60/minute, burst: 10 }
+  tools:
+    - tool: fake__count
+      rate: 10/minute
+      burst: 2

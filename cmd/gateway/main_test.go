@@ -209,7 +209,7 @@ func writeConfig(t *testing.T, upstreams ...upstreamEntry) string {
 	for _, u := range upstreams {
 		fmt.Fprintf(&p, "      - tool: %s__*\n", u.name)
 	}
-	p.WriteString("agents:\n  tester: [all]\n")
+	p.WriteString("agents:\n  tester: [all]\nlimits:\n  default: { rate: 1000/second, burst: 1000 }\n")
 	if err := os.WriteFile(filepath.Join(dir, "policy.yaml"), []byte(p.String()), 0o600); err != nil {
 		t.Fatal(err)
 	}
