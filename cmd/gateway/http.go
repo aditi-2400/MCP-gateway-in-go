@@ -56,7 +56,7 @@ func checkHTTPFlags(f flags) error {
 
 	loopback, err := isLoopback(f.httpAddr)
 	if err != nil {
-		return err
+		return fmt.Errorf("-http %w", err)
 	}
 	if !loopback && !useTLS && !f.behindTLSProxy {
 		return fmt.Errorf("-http %q: a non-loopback address needs -tls-cert and -tls-key, or -behind-tls-proxy if a proxy in front terminates TLS; plain HTTP would expose API keys on the network", f.httpAddr)
@@ -69,7 +69,7 @@ func checkHTTPFlags(f flags) error {
 func isLoopback(addr string) (bool, error) {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
-		return false, fmt.Errorf("-http %q: %w", addr, err)
+		return false, fmt.Errorf("%q: %w", addr, err)
 	}
 	if host == "localhost" {
 		return true, nil

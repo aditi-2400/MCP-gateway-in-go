@@ -6,6 +6,7 @@
 //
 //	gateway -config gateway.yaml -policy policy.yaml [-call-timeout 60s] [-log-level info]
 //	gateway -config gateway.yaml -policy policy.yaml -http 127.0.0.1:8080 [-allow-origin URL]...
+//	gateway ... -metrics 127.0.0.1:9090
 //	gateway keygen -agent NAME
 //	gateway audit -db audit.db [-agent NAME] [-tool NAME] [-decision D] [-since 1h] [-json]
 //
@@ -16,6 +17,9 @@
 // Without -http it speaks MCP over stdin and stdout, and logs go to stderr
 // because stdout carries MCP messages. With -http it serves Streamable HTTP
 // at /mcp and does not read stdin.
+//
+// With -metrics it also serves Prometheus metrics at /metrics on a separate
+// address, in either mode.
 package main
 
 import (
@@ -25,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -36,6 +41,7 @@ import (
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/auth"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/config"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/metrics"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/policy"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/progress"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/proxy"
@@ -73,18 +79,20 @@ func main() {
 }
 
 type flags struct {
-	configPath     string
-	policyPath     string
-	auditDB        string
-	auditQueue     int
-	auditWait      time.Duration
-	callTimeout    time.Duration
-	logLevel       slog.Level
-	httpAddr       string // empty means stdio
-	allowedOrigins stringList
-	tlsCert        string
-	tlsKey         string
-	behindTLSProxy bool
+	configPath         string
+	policyPath         string
+	auditDB            string
+	auditQueue         int
+	auditWait          time.Duration
+	callTimeout        time.Duration
+	logLevel           slog.Level
+	httpAddr           string // empty means stdio
+	allowedOrigins     stringList
+	tlsCert            string
+	tlsKey             string
+	behindTLSProxy     bool
+	metricsAddr        string // empty means no metrics
+	metricsAllowRemote bool
 }
 
 // stringList is a flag that can be given more than once.
@@ -118,6 +126,8 @@ func parseFlags(args []string, stderr io.Writer) (flags, error) {
 	fs.StringVar(&f.tlsCert, "tls-cert", "", "PEM certificate file; serve HTTPS (needs -tls-key)")
 	fs.StringVar(&f.tlsKey, "tls-key", "", "PEM private key file for -tls-cert")
 	fs.BoolVar(&f.behindTLSProxy, "behind-tls-proxy", false, "allow plain HTTP on a non-loopback address because a proxy in front terminates TLS")
+	fs.StringVar(&f.metricsAddr, "metrics", "", "serve Prometheus metrics at /metrics on this address (e.g. 127.0.0.1:9090); loopback only unless -metrics-allow-remote")
+	fs.BoolVar(&f.metricsAllowRemote, "metrics-allow-remote", false, "allow -metrics on a non-loopback address; the endpoint has no authentication")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -147,6 +157,9 @@ func parseFlags(args []string, stderr io.Writer) (flags, error) {
 		return flags{}, usageFailure(fs, "-call-timeout must be positive")
 	}
 	if err := checkHTTPFlags(f); err != nil {
+		return flags{}, usageFailure(fs, err.Error())
+	}
+	if err := checkMetricsFlags(f); err != nil {
 		return flags{}, usageFailure(fs, err.Error())
 	}
 	return f, nil
@@ -203,6 +216,20 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		}
 		logger.Info("agent authenticated", "agent", agent.Name)
 		ctx = auth.WithAgent(ctx, agent)
+	}
+
+	// Listening now means a busy port stops startup before any upstream
+	// starts. Serving waits until the metrics exist, below.
+	var metricsLn net.Listener
+	if f.metricsAddr != "" {
+		metricsLn, err = net.Listen("tcp", f.metricsAddr)
+		if err != nil {
+			return fmt.Errorf("listen on %s: %w", f.metricsAddr, err)
+		}
+		// Closes the listener if startup fails before the metrics server
+		// takes it over. Once it has, the server closes it and this second
+		// close only reports that it is already closed.
+		defer metricsLn.Close()
 	}
 
 	// Opened before upstreams start, so a bad path stops startup early.
@@ -271,6 +298,14 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	})
 	prx.Store(p)
 
+	var ms *metricsServer
+	if metricsLn != nil {
+		m := metrics.New(rt.KnownTool, knownAgents(cfg))
+		m.WatchAuditQueue(recorder.Used, recorder.Capacity)
+		audited.SetObserver(m)
+		ms = startMetrics(metricsLn, m.Handler(), logger.With("component", "metrics"))
+	}
+
 	var serveErr error
 	if f.httpAddr != "" {
 		serveErr = serveHTTP(ctx, audited, guard, authn, tracker, group, f, tlsConfig, logger)
@@ -281,6 +316,13 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		// Ctrl+C or SIGTERM is a normal way to stop.
 		logger.Info("shutting down on signal")
 		serveErr = nil
+	}
+
+	var metricsErr error
+	if ms != nil {
+		if metricsErr = ms.stop(); metricsErr != nil {
+			logger.Warn("metrics shutdown", "error", metricsErr)
+		}
 	}
 
 	// Every call has finished, so flush the audit log before stopping
@@ -294,7 +336,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		logger.Warn("upstream shutdown", "error", closeErr)
 	}
 	logger.Info("gateway stopped")
-	return errors.Join(serveErr, auditErr, closeErr)
+	return errors.Join(serveErr, metricsErr, auditErr, closeErr)
 }
 
 // loadPolicy reads the policy and checks it against the config, so a rule

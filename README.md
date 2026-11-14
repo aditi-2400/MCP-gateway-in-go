@@ -4,7 +4,7 @@ A gateway that sits between AI agents and MCP servers.
 
 Agents connect to the gateway as if it were a single MCP server. Behind it, the gateway connects to many upstream MCP servers (filesystem, database, GitHub, and so on). Every tool call goes through the gateway, so it can decide who may call which tool, how often, and with which arguments. It logs every call.
 
-> Status: the gateway runs over stdio or Streamable HTTP in front of several upstream MCP servers, merges their tools under prefixed names, and routes each tool call to the right server. Every caller needs an API key, and a policy file decides which tools each agent can see and call, with checks on the arguments and a rate limit per agent and tool. Every tool call is recorded in a SQLite audit log, with secrets taken out of the arguments.
+> Status: the gateway runs over stdio or Streamable HTTP in front of several upstream MCP servers, merges their tools under prefixed names, and routes each tool call to the right server. Every caller needs an API key, and a policy file decides which tools each agent can see and call, with checks on the arguments and a rate limit per agent and tool. Every tool call is recorded in a SQLite audit log, with secrets taken out of the arguments. With `-metrics`, it also serves Prometheus metrics.
 
 ## Why
 
@@ -43,6 +43,7 @@ One gateway process serves either stdio or HTTP, picked with the `-http` flag.
 - **`internal/policy`** loads the policy file and sits in front of the router. It reads the agent that auth attached to the request, hides tools the agent may not call from `tools/list`, and checks every `tools/call` before it reaches the router. Methods it has no rule for are refused, so a method added to the router later can't skip the policy by accident.
 - **`internal/audit`** comes first for every `tools/call`. It reserves room in the audit queue before anything else runs, so a call that can't be recorded is refused. When the call ends it writes one entry, whatever happened. Entries go to SQLite in the background.
 - **`internal/ratelimit`** sits between the policy and the router, so calls the policy denies never use up tokens. Each agent has a token bucket per tool. A call that finds its bucket empty gets error `-31029` and never reaches the upstream.
+- **`internal/metrics`** counts tool calls, denials, and latency for Prometheus. The audit layer tells it about every call it finishes.
 - **`internal/fakeupstream`** is a small MCP server with `echo`, `add`, and `fail` tools, used in tests.
 
 When an upstream doesn't reply, the client gets a JSON-RPC error (`-32603`) saying "upstream timed out", "upstream unavailable", or "upstream error". The details go to the log only. Calls are never retried.
@@ -58,7 +59,7 @@ When an upstream doesn't reply, the client gets a JSON-RPC error (`-32603`) sayi
 | Policy engine | YAML rules, default deny, argument checks like path prefixes and blocked SQL | Built |
 | Rate limiting | Token bucket per agent and per tool | Built |
 | Audit log | Append-only SQLite log of every tool call, with redacted arguments | Built |
-| Observability | Prometheus metrics and OpenTelemetry traces | Planned |
+| Observability | Prometheus metrics and OpenTelemetry traces | Metrics built |
 | Resilience | Timeouts, circuit breakers, no automatic retries on tools with side effects | Timeouts built |
 | Description pinning | Hashes tool descriptions and quarantines a tool if its description changes | Planned |
 
@@ -87,7 +88,7 @@ internal/auth/          API key identification
 internal/policy/        rules, argument checks, and the guard in front of the router
 internal/ratelimit/     per-agent, per-tool token buckets
 internal/audit/         redaction, audit queue, SQLite store, and the audit layer
-internal/metrics/       Prometheus and OpenTelemetry (planned)
+internal/metrics/       Prometheus metrics, fed by the audit layer
 internal/pinning/       tool description hashing and quarantine (planned)
 testdata/fakeupstream/  entry point for the fake server binary
 ```
@@ -119,6 +120,7 @@ gateway -config gateway.yaml -policy policy.yaml -audit-db audit.db [-call-timeo
 gateway -config gateway.yaml -policy policy.yaml -audit-db audit.db -http 127.0.0.1:8080 [-allow-origin http://localhost:3000]...
 gateway -config gateway.yaml -policy policy.yaml -audit-db audit.db -http 0.0.0.0:8443 -tls-cert cert.pem -tls-key key.pem
 gateway -config gateway.yaml -policy policy.yaml -audit-db audit.db -http :8080 -behind-tls-proxy
+gateway -config gateway.yaml -policy policy.yaml -audit-db audit.db -metrics 127.0.0.1:9090 [-metrics-allow-remote]
 gateway keygen -agent NAME
 gateway audit -db audit.db [-agent NAME] [-tool NAME] [-decision D] [-since 1h] [-limit N] [-json]
 ```
@@ -264,6 +266,30 @@ curl -s http://127.0.0.1:8080/mcp \
 ```
 
 Because the request has a `progressToken`, the reply is an SSE stream: two `notifications/progress` events with the token `t1`, then the result. Without a token, or if no progress arrives, the reply is plain JSON.
+
+### Metrics
+
+`-metrics ADDR` serves Prometheus metrics at `GET /metrics` on its own address, in both stdio and HTTP mode. The endpoint has no API key check and shows agent and tool names, so the gateway only lets it listen on loopback unless you add `-metrics-allow-remote`. If you do, make sure only your Prometheus server can reach it.
+
+| Metric | Labels | What it shows |
+|---|---|---|
+| `mcpgw_tool_calls_total` | agent, tool, decision, status | every tool call and how it ended |
+| `mcpgw_tool_call_denials_total` | agent, tool, reason | refused calls; reason is `tool`, `arguments`, or `rate_limited` |
+| `mcpgw_tool_call_duration_seconds` | decision | total time a call spent in the gateway |
+| `mcpgw_upstream_latency_seconds` | tool | time forwarded calls spent upstream |
+| `mcpgw_audit_refused_total` | | calls refused because the audit queue was full |
+| `mcpgw_audit_queue_slots_used`, `mcpgw_audit_queue_slots` | | how full the audit queue is |
+
+Go runtime and process metrics (`go_*`, `process_*`) are included too.
+
+The counts come from the audit layer, so metrics and the audit log always count the same calls. Comparing the two time histograms shows how much time the gateway itself adds.
+
+Prometheus keeps one series per distinct label value, so every label comes from a short known list. Agent names come from the config, and anything else shows as `none`. Tool names are the ones an upstream listed, and anything else shows as `other`, so an agent making up tool names can't create new series. One side effect: a real tool also shows as `other` until the gateway has fetched its upstream's tool list. That happens on `tools/list`, and over HTTP also on the first call to one of that upstream's tools, since checking the `Mcp-Param` headers needs the schema.
+
+```sh
+./bin/gateway -config bin/my.yaml -policy testdata/config/example-policy.yaml -audit-db bin/audit.db -http 127.0.0.1:8080 -metrics 127.0.0.1:9090 &
+curl -sS http://127.0.0.1:9090/metrics | grep '^mcpgw_'
+```
 
 ## Known limits
 

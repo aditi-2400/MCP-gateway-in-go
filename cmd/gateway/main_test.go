@@ -380,6 +380,7 @@ func TestParseFlags(t *testing.T) {
 		wantTimeout time.Duration
 		wantHTTP    string
 		wantOrigins string
+		wantMetrics string
 	}{
 		{name: "config only", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second},
 		{name: "config with equals", args: []string{"-config=g.yaml", "-policy=p.yaml", "-audit-db=a.db"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second},
@@ -421,6 +422,13 @@ func TestParseFlags(t *testing.T) {
 		{name: "TLS and proxy together", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-http", "0.0.0.0:8443", "-tls-cert", "c.pem", "-tls-key", "k.pem", "-behind-tls-proxy"}, wantErr: errUsage},
 		{name: "TLS without http", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-tls-cert", "c.pem", "-tls-key", "k.pem"}, wantErr: errUsage},
 		{name: "proxy flag without http", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-behind-tls-proxy"}, wantErr: errUsage},
+		{name: "metrics on loopback", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-metrics", "127.0.0.1:9090"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantMetrics: "127.0.0.1:9090"},
+		{name: "metrics with http", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-http", "127.0.0.1:8080", "-metrics", "localhost:9090"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantHTTP: "127.0.0.1:8080", wantMetrics: "localhost:9090"},
+		{name: "metrics on all interfaces", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-metrics", ":9090"}, wantErr: errUsage},
+		{name: "metrics on a LAN address", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-metrics", "192.168.1.10:9090"}, wantErr: errUsage},
+		{name: "metrics on all interfaces when allowed", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-metrics", ":9090", "-metrics-allow-remote"}, wantConfig: "g.yaml", wantTimeout: 60 * time.Second, wantMetrics: ":9090"},
+		{name: "metrics without port", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-metrics", "127.0.0.1"}, wantErr: errUsage},
+		{name: "allow remote without metrics", args: []string{"-config", "g.yaml", "-policy", "p.yaml", "-audit-db", "a.db", "-metrics-allow-remote"}, wantErr: errUsage},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -439,6 +447,9 @@ func TestParseFlags(t *testing.T) {
 			}
 			if f.callTimeout != tt.wantTimeout {
 				t.Errorf("callTimeout = %v, want %v", f.callTimeout, tt.wantTimeout)
+			}
+			if f.metricsAddr != tt.wantMetrics {
+				t.Errorf("metricsAddr = %q, want %q", f.metricsAddr, tt.wantMetrics)
 			}
 			if f.httpAddr != tt.wantHTTP || f.allowedOrigins.String() != tt.wantOrigins {
 				t.Errorf("http = %q origins = %q, want %q and %q", f.httpAddr, f.allowedOrigins.String(), tt.wantHTTP, tt.wantOrigins)
