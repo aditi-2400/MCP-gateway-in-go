@@ -44,6 +44,7 @@ One gateway process serves either stdio or HTTP, picked with the `-http` flag.
 - **`internal/audit`** comes first for every `tools/call`. It reserves room in the audit queue before anything else runs, so a call that can't be recorded is refused. When the call ends it writes one entry, whatever happened. Entries go to SQLite in the background.
 - **`internal/ratelimit`** sits between the policy and the router, so calls the policy denies never use up tokens. Each agent has a token bucket per tool. A call that finds its bucket empty gets error `-31029` and never reaches the upstream.
 - **`internal/metrics`** counts tool calls, denials, and latency for Prometheus. The audit layer tells it about every call it finishes.
+- **`internal/tracing`** wraps every upstream connection. Clients may put trace context (`traceparent`, `tracestate`, `baggage`) in `_meta`, but it is untrusted, so the gateway removes it before a call reaches an upstream. OpenTelemetry tracing itself is not switched on yet.
 - **`internal/fakeupstream`** is a small MCP server with `echo`, `add`, and `fail` tools, used in tests.
 
 When an upstream doesn't reply, the client gets a JSON-RPC error (`-32603`) saying "upstream timed out", "upstream unavailable", or "upstream error". The details go to the log only. Calls are never retried.

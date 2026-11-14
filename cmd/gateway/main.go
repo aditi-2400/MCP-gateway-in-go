@@ -37,6 +37,9 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
+
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/audit"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/auth"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/config"
@@ -47,6 +50,7 @@ import (
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/proxy"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/ratelimit"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/router"
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/tracing"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/upstream"
 )
 
@@ -279,7 +283,15 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		logger.Info("upstream started", "upstream", u.Name, "command", u.Command)
 	}
 
-	rt, err := router.New(routes(group), router.Options{Logger: logger.With("component", "router")})
+	// Every upstream call goes through tracing.WrapUpstream, even with
+	// tracing off: it removes the trace keys a client put in _meta, which are
+	// untrusted, before anything reaches an upstream. Span names need the
+	// router's tool list, and the router is built from the wrapped upstreams,
+	// so knownTool reads rt once it is set; no call runs before that.
+	tracer := noop.NewTracerProvider().Tracer("")
+	var rt *router.Router
+	knownTool := func(name string) bool { return rt.KnownTool(name) }
+	rt, err = router.New(routes(group, tracer, knownTool), router.Options{Logger: logger.With("component", "router")})
 	if err != nil {
 		return errors.Join(err, closeAudit(), group.Close())
 	}
@@ -376,11 +388,12 @@ func upstreamSpecs(cfg *config.Config) []upstream.Spec {
 	return specs
 }
 
-func routes(g *upstream.Group) []router.Named {
+// routes names each upstream for the router, wrapped for tracing.
+func routes(g *upstream.Group, tracer trace.Tracer, knownTool func(string) bool) []router.Named {
 	members := g.Members()
 	named := make([]router.Named, len(members))
 	for i, m := range members {
-		named[i] = router.Named{Name: m.Name, Upstream: m.Process}
+		named[i] = router.Named{Name: m.Name, Upstream: tracing.WrapUpstream(m.Name, m.Process, tracer, knownTool)}
 	}
 	return named
 }

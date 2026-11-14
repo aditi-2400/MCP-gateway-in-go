@@ -14,6 +14,9 @@ type tool struct {
 	InputSchema  json.RawMessage `json:"inputSchema"`
 	OutputSchema json.RawMessage `json:"outputSchema,omitempty"`
 	run          func(args json.RawMessage, report progressFunc) callResult
+	// readMeta, if set, runs the tool in place of run, with the trace keys
+	// the call carried in _meta.
+	readMeta func(traceMeta) callResult
 }
 
 // progressFunc sends a progress notification for the current call. It does
@@ -58,6 +61,12 @@ var tools = []tool{
 			`"query":{"type":"string"}},"required":["region"]}`),
 		run: runLookup,
 	},
+	{
+		Name:        "meta",
+		Description: "Returns the trace context keys (traceparent, tracestate, baggage) it received in _meta. Used to test what the gateway forwards.",
+		InputSchema: json.RawMessage(`{"type":"object","additionalProperties":false}`),
+		readMeta:    runMeta,
+	},
 }
 
 type textContent struct {
@@ -100,6 +109,7 @@ func callTool(params json.RawMessage, notify func(*jsonrpc.Message)) (any, *json
 		Arguments json.RawMessage `json:"arguments"`
 		Meta      struct {
 			ProgressToken json.RawMessage `json:"progressToken"`
+			traceMeta
 		} `json:"_meta"`
 	}
 	if err := json.Unmarshal(params, &p); err != nil {
@@ -130,6 +140,9 @@ func callTool(params json.RawMessage, notify func(*jsonrpc.Message)) (any, *json
 	}
 	for _, t := range tools {
 		if t.Name == p.Name {
+			if t.readMeta != nil {
+				return t.readMeta(p.Meta.traceMeta), nil
+			}
 			return t.run(p.Arguments, report), nil
 		}
 	}
@@ -189,5 +202,23 @@ func runCount(args json.RawMessage, report progressFunc) callResult {
 func runLookup(args json.RawMessage, _ progressFunc) callResult {
 	r := textResult(string(args))
 	r.StructuredContent = args
+	return r
+}
+
+// traceMeta holds the trace context keys of a call's _meta. Missing keys
+// stay nil.
+type traceMeta struct {
+	Traceparent *string `json:"traceparent,omitempty"`
+	Tracestate  *string `json:"tracestate,omitempty"`
+	Baggage     *string `json:"baggage,omitempty"`
+}
+
+func runMeta(m traceMeta) callResult {
+	data, err := json.Marshal(m)
+	if err != nil {
+		return toolError("encode: " + err.Error())
+	}
+	r := textResult(string(data))
+	r.StructuredContent = m
 	return r
 }

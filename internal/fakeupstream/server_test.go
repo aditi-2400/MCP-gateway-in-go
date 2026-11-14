@@ -125,8 +125,8 @@ func TestToolsList(t *testing.T) {
 		}
 	}
 	// Order must be stable so clients can cache the list.
-	if got := strings.Join(names, ","); got != "echo,add,fail,count,lookup" {
-		t.Errorf("tool names = %s, want echo,add,fail,count,lookup", got)
+	if got := strings.Join(names, ","); got != "echo,add,fail,count,lookup,meta" {
+		t.Errorf("tool names = %s, want echo,add,fail,count,lookup,meta", got)
 	}
 }
 
@@ -450,5 +450,24 @@ func TestLookupEchoesArguments(t *testing.T) {
 	decodeResult(t, serveOne(t, request(`1`, "tools/call", `"name":"lookup","arguments":{"region":"us-west1","limit":5}`)), &result)
 	if string(result.StructuredContent) != `{"region":"us-west1","limit":5}` {
 		t.Fatalf("structuredContent = %s, want the arguments", result.StructuredContent)
+	}
+}
+
+func TestMetaReturnsTheTraceKeysItGot(t *testing.T) {
+	line := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"meta","_meta":{` +
+		`"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},` +
+		`"traceparent":"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01","baggage":"user=alice"}}}`
+	var result struct {
+		StructuredContent json.RawMessage `json:"structuredContent"`
+	}
+	decodeResult(t, serveOne(t, line), &result)
+	want := `{"traceparent":"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01","baggage":"user=alice"}`
+	if string(result.StructuredContent) != want {
+		t.Errorf("structuredContent = %s, want %s", result.StructuredContent, want)
+	}
+
+	decodeResult(t, serveOne(t, request(`2`, "tools/call", `"name":"meta"`)), &result)
+	if string(result.StructuredContent) != `{}` {
+		t.Errorf("with no trace keys, structuredContent = %s, want {}", result.StructuredContent)
 	}
 }
