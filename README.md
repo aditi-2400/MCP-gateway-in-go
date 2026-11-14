@@ -235,8 +235,8 @@ These are planned for Week 5.
 ## Roadmap
 
 1. Passthrough proxy over stdio, standard library only (done)
-2. Multiple upstreams, tool namespacing, HTTP frontend, sessions
-3. API key auth and the policy engine
+2. Multiple upstreams, tool namespacing, Streamable HTTP frontend (done)
+3. API key auth and the policy engine (done)
 4. Rate limiting, audit log, metrics
 5. Timeouts, circuit breakers, description pinning, load tests, demo
 
