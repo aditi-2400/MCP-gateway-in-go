@@ -3,15 +3,25 @@
 // The rule is default deny: a call is allowed only if one of the agent's
 // roles has a rule that matches the tool. An agent with no roles, an agent
 // missing from the policy, or a tool no rule mentions is always denied.
+//
+// A rule can also check arguments: folders a path must stay inside,
+// patterns a value must not match, and length limits. Arguments a rule
+// with checks does not list are denied too.
 package policy
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"go.yaml.in/yaml/v4"
 
@@ -37,9 +47,32 @@ type Role struct {
 }
 
 // Rule allows one tool (fs__read_file) or every tool of one upstream
-// (github__*).
+// (github__*). A rule without Args allows any arguments. A rule with Args
+// allows only the arguments it lists, and each one must pass its checks.
 type Rule struct {
-	Tool string `yaml:"tool"`
+	Tool string             `yaml:"tool"`
+	Args map[string]ArgRule `yaml:"args"`
+}
+
+// ArgRule holds the checks for one top-level argument. An empty ArgRule
+// (written `mode: {}`) allows the argument with any value, or leaving it
+// out. An ArgRule with any check makes the argument required, because the
+// upstream's default for a missing argument could be anything.
+type ArgRule struct {
+	// PathPrefix lists folders the value must be inside, after cleaning.
+	PathPrefix []string `yaml:"path_prefix"`
+	// DenyPatterns are Go regular expressions, matched without regard to
+	// case. A value matching any of them is denied.
+	DenyPatterns []string `yaml:"deny_patterns"`
+	// MaxLength caps a string's length in bytes. For any other JSON value
+	// it caps the length of the value's JSON text.
+	MaxLength *int `yaml:"max_length"`
+
+	denyRegexps []*regexp.Regexp // compiled from DenyPatterns by validate
+}
+
+func (r ArgRule) hasChecks() bool {
+	return len(r.PathPrefix) > 0 || len(r.denyRegexps) > 0 || r.MaxLength != nil
 }
 
 // Decision is the answer for one call, with enough detail to log and audit.
@@ -91,9 +124,11 @@ func (p *Policy) validate() error {
 			errs = append(errs, fmt.Errorf("role %q has no rules", name))
 		}
 		for i, rule := range role.Allow {
+			where := fmt.Sprintf("role %q: allow[%d]", name, i)
 			if err := checkToolPattern(rule.Tool); err != nil {
-				errs = append(errs, fmt.Errorf("role %q: allow[%d]: %w", name, i, err))
+				errs = append(errs, fmt.Errorf("%s: %w", where, err))
 			}
+			errs = append(errs, compileArgs(where, rule)...)
 		}
 	}
 
@@ -141,6 +176,71 @@ func checkToolPattern(pattern string) error {
 	return nil
 }
 
+// compileArgs checks a rule's argument section and compiles its deny
+// patterns. Writing back into rule.Args updates the policy, because a map
+// is shared between copies of the Rule.
+func compileArgs(where string, rule Rule) []error {
+	if rule.Args == nil {
+		return nil
+	}
+	if strings.HasSuffix(rule.Tool, separator+wildcard) {
+		return []error{fmt.Errorf("%s: args are not allowed on %q, since each tool has its own arguments", where, rule.Tool)}
+	}
+	var errs []error
+	for _, argName := range sortedKeys(rule.Args) {
+		ar := rule.Args[argName]
+		at := fmt.Sprintf("%s: argument %q", where, argName)
+		if argName == "" {
+			errs = append(errs, fmt.Errorf("%s: argument name is empty", where))
+		}
+		// An empty list would mean "no path check", which reads like "no
+		// path allowed". Refuse it so the file can't mean the opposite of
+		// what it seems to say.
+		if ar.PathPrefix != nil && len(ar.PathPrefix) == 0 {
+			errs = append(errs, fmt.Errorf("%s: path_prefix is empty", at))
+		}
+		for _, prefix := range ar.PathPrefix {
+			if err := checkPathPrefix(prefix); err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", at, err))
+			}
+		}
+		ar.denyRegexps = nil
+		for _, pattern := range ar.DenyPatterns {
+			if pattern == "" {
+				errs = append(errs, fmt.Errorf("%s: empty deny pattern would match every value", at))
+				continue
+			}
+			re, err := regexp.Compile("(?i)" + pattern)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s: deny pattern %q: %w", at, pattern, err))
+				continue
+			}
+			ar.denyRegexps = append(ar.denyRegexps, re)
+		}
+		if ar.MaxLength != nil && *ar.MaxLength <= 0 {
+			errs = append(errs, fmt.Errorf("%s: max_length must be positive", at))
+		}
+		rule.Args[argName] = ar
+	}
+	return errs
+}
+
+// checkPathPrefix wants an absolute, already clean folder, so the prefix
+// compared at call time is exactly the one written in the file.
+func checkPathPrefix(prefix string) error {
+	switch {
+	case !strings.HasPrefix(prefix, "/"):
+		return fmt.Errorf("path_prefix %q must be absolute", prefix)
+	case prefix == "/":
+		return errors.New(`path_prefix "/" allows every path; remove path_prefix instead`)
+	case strings.ContainsAny(prefix, "\x00\\"):
+		return fmt.Errorf("path_prefix %q contains a null byte or backslash", prefix)
+	case path.Clean(prefix) != prefix:
+		return fmt.Errorf("path_prefix %q is not clean; write %q", prefix, path.Clean(prefix))
+	}
+	return nil
+}
+
 // CheckNames compares the policy with the main config. A rule for an
 // upstream that does not exist is likely a typo, and an agent with no key
 // in the config could never authenticate, so both are errors. Config agents
@@ -163,7 +263,9 @@ func (p *Policy) CheckNames(upstreams, agents []string) error {
 	return errors.Join(errs...)
 }
 
-// AllowTool decides whether agent may call tool, ignoring arguments.
+// AllowTool decides whether agent may call tool with some arguments. It
+// ignores argument checks, so it answers "should this agent see the tool in
+// tools/list". Use AllowCall for an actual call.
 func (p *Policy) AllowTool(agent, tool string) Decision {
 	roles, ok := p.Agents[agent]
 	if !ok {
@@ -172,15 +274,193 @@ func (p *Policy) AllowTool(agent, tool string) Decision {
 	for _, roleName := range roles {
 		for _, rule := range p.Roles[roleName].Allow {
 			if matches(rule.Tool, tool) {
-				return Decision{
-					Allowed: true,
-					Rule:    roleName + ": " + rule.Tool,
-					Reason:  fmt.Sprintf("role %q allows %s", roleName, rule.Tool),
-				}
+				return allowed(roleName, rule)
 			}
 		}
 	}
 	return Decision{Reason: fmt.Sprintf("no role of agent %q allows tool %q", agent, tool)}
+}
+
+// AllowCall decides whether agent may call tool with these arguments.
+// arguments is the raw "arguments" value of tools/call; nil or null means
+// none were sent. The call is allowed if any matching rule passes.
+//
+// Reasons name arguments but never include their values, because values can
+// hold secrets and reasons end up in logs.
+func (p *Policy) AllowCall(agent, tool string, arguments json.RawMessage) Decision {
+	roles, ok := p.Agents[agent]
+	if !ok {
+		return Decision{Reason: fmt.Sprintf("agent %q is not in the policy", agent)}
+	}
+	var (
+		args     map[string]json.RawMessage
+		parseErr error
+		parsed   bool
+		failures []string
+	)
+	for _, roleName := range roles {
+		for _, rule := range p.Roles[roleName].Allow {
+			if !matches(rule.Tool, tool) {
+				continue
+			}
+			if rule.Args == nil {
+				return allowed(roleName, rule)
+			}
+			// Parse only when a rule needs the arguments, and only once.
+			if !parsed {
+				args, parseErr = parseArguments(arguments)
+				parsed = true
+			}
+			err := parseErr
+			if err == nil {
+				err = checkArgs(rule.Args, args)
+			}
+			if err == nil {
+				return allowed(roleName, rule)
+			}
+			failures = append(failures, fmt.Sprintf("role %q rule %s: %v", roleName, rule.Tool, err))
+		}
+	}
+	if len(failures) == 0 {
+		return Decision{Reason: fmt.Sprintf("no role of agent %q allows tool %q", agent, tool)}
+	}
+	return Decision{Reason: strings.Join(failures, "; ")}
+}
+
+func allowed(roleName string, rule Rule) Decision {
+	return Decision{
+		Allowed: true,
+		Rule:    roleName + ": " + rule.Tool,
+		Reason:  fmt.Sprintf("role %q allows %s", roleName, rule.Tool),
+	}
+}
+
+// parseArguments reads the arguments object by hand for two reasons. A
+// repeated key is refused, because the gateway and the upstream might keep
+// different copies (Go keeps the last; some parsers keep the first), and
+// then the gateway would check one value while the upstream used the other.
+// And invalid UTF-8 is refused, because Go would quietly replace it, so the
+// checked string would differ from the bytes forwarded.
+func parseArguments(raw json.RawMessage) (map[string]json.RawMessage, error) {
+	raw = bytes.TrimSpace(raw)
+	args := make(map[string]json.RawMessage)
+	if len(raw) == 0 || string(raw) == "null" {
+		return args, nil
+	}
+	if !utf8.Valid(raw) {
+		return nil, errors.New("arguments are not valid UTF-8")
+	}
+	notJSON := errors.New("arguments are not valid JSON")
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, notJSON
+	}
+	if tok != json.Delim('{') {
+		return nil, errors.New("arguments must be an object")
+	}
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, notJSON
+		}
+		key, ok := tok.(string)
+		if !ok {
+			return nil, notJSON
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return nil, notJSON
+		}
+		if _, dup := args[key]; dup {
+			return nil, fmt.Errorf("argument %q appears more than once", key)
+		}
+		args[key] = value
+	}
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+		return nil, notJSON
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errors.New("arguments have data after the object")
+	}
+	return args, nil
+}
+
+// checkArgs applies a rule's argument checks. Names are compared exactly,
+// so "Path" is a different, unlisted argument from "path".
+func checkArgs(rules map[string]ArgRule, args map[string]json.RawMessage) error {
+	for _, name := range sortedKeys(args) {
+		if _, ok := rules[name]; !ok {
+			return fmt.Errorf("argument %q is not allowed", name)
+		}
+	}
+	for _, name := range sortedKeys(rules) {
+		r := rules[name]
+		value, ok := args[name]
+		if !ok {
+			if r.hasChecks() {
+				return fmt.Errorf("argument %q is missing", name)
+			}
+			continue
+		}
+		if err := r.check(value); err != nil {
+			return fmt.Errorf("argument %q %w", name, err)
+		}
+	}
+	return nil
+}
+
+// check tests one value. Errors finish the sentence "argument X ...".
+func (r ArgRule) check(value json.RawMessage) error {
+	var s string
+	isString := len(value) > 0 && value[0] == '"' && json.Unmarshal(value, &s) == nil
+	if !isString && (len(r.PathPrefix) > 0 || len(r.denyRegexps) > 0) {
+		return errors.New("must be a string")
+	}
+	// Length goes first, so the regular expressions only ever see bounded
+	// input.
+	if r.MaxLength != nil {
+		n := len(value)
+		if isString {
+			n = len(s)
+		}
+		if n > *r.MaxLength {
+			return fmt.Errorf("is longer than %d bytes", *r.MaxLength)
+		}
+	}
+	if len(r.PathPrefix) > 0 {
+		if err := checkPath(s, r.PathPrefix); err != nil {
+			return err
+		}
+	}
+	for _, re := range r.denyRegexps {
+		if re.MatchString(s) {
+			return fmt.Errorf("matches denied pattern %q", re.String())
+		}
+	}
+	return nil
+}
+
+// checkPath cleans the path lexically and then compares whole folder
+// names, so /tmp/ws/../../etc becomes /etc (outside) and /tmp/ws-evil is
+// not inside /tmp/ws. It can't follow symlinks: the files live on the
+// upstream's machine, which the gateway can't see.
+func checkPath(value string, prefixes []string) error {
+	// A null byte can cut a path short in C-based code, and a backslash is
+	// a separator on Windows that path.Clean does not know about.
+	if strings.ContainsAny(value, "\x00\\") {
+		return errors.New("contains a null byte or backslash")
+	}
+	if !strings.HasPrefix(value, "/") {
+		return errors.New("must be an absolute path")
+	}
+	clean := path.Clean(value)
+	for _, prefix := range prefixes {
+		if clean == prefix || strings.HasPrefix(clean, prefix+"/") {
+			return nil
+		}
+	}
+	return errors.New("is outside the allowed folders")
 }
 
 // matches compares exactly, or by upstream for upstream__*. It is

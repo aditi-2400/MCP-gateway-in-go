@@ -4,10 +4,17 @@
 # Roles hold rules. A rule names one tool (fake__echo) or every tool of one
 # upstream (fake__*). Agents get roles; an agent missing from this file, or
 # with no roles, can call nothing.
+#
+# A rule with "args" allows only the arguments it lists. Each can have
+# checks: path_prefix (folders a path must stay inside), deny_patterns (Go
+# regular expressions, case-insensitive), and max_length. An argument with
+# checks must be sent; one written as "{}" may be sent with any value.
 roles:
   basic:
     allow:
       - tool: fake__echo
+        args:
+          text: { max_length: 200, deny_patterns: ['\bpassword\b'] }
       - tool: fake__add
 
 agents:

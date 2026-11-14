@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -166,7 +167,10 @@ func TestLoadExamplePolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if !p.AllowTool("example", "fake__echo").Allowed {
-		t.Error("example policy does not let the example agent call fake__echo")
+	if d := p.AllowCall("example", "fake__echo", json.RawMessage(`{"text":"hi"}`)); !d.Allowed {
+		t.Errorf("example policy denies fake__echo: %s", d.Reason)
+	}
+	if d := p.AllowCall("example", "fake__echo", json.RawMessage(`{"text":"my Password is x"}`)); d.Allowed {
+		t.Error("example policy allows fake__echo text matching its deny pattern")
 	}
 }
