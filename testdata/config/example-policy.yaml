@@ -16,6 +16,7 @@ roles:
         args:
           text: { max_length: 200, deny_patterns: ['\bpassword\b'] }
       - tool: fake__add
+      - tool: fake__count
 
 agents:
   example: [basic]

@@ -4,8 +4,8 @@
 //
 // Usage:
 //
-//	gateway -config gateway.yaml [-call-timeout 60s] [-log-level info]
-//	gateway -config gateway.yaml -http 127.0.0.1:8080 [-allow-origin URL]...
+//	gateway -config gateway.yaml -policy policy.yaml [-call-timeout 60s] [-log-level info]
+//	gateway -config gateway.yaml -policy policy.yaml -http 127.0.0.1:8080 [-allow-origin URL]...
 //	gateway keygen -agent NAME
 //
 // Every caller needs an API key from keygen. Over stdio it goes in the
@@ -34,6 +34,7 @@ import (
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/auth"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/config"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/policy"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/progress"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/proxy"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/router"
@@ -66,6 +67,7 @@ func main() {
 
 type flags struct {
 	configPath     string
+	policyPath     string
 	callTimeout    time.Duration
 	logLevel       slog.Level
 	httpAddr       string // empty means stdio
@@ -95,6 +97,7 @@ func parseFlags(args []string, stderr io.Writer) (flags, error) {
 
 	f := flags{logLevel: slog.LevelInfo}
 	fs.StringVar(&f.configPath, "config", "", "path to the YAML config file listing upstream servers (required)")
+	fs.StringVar(&f.policyPath, "policy", "", "path to the YAML policy file saying which agent may call which tool (required)")
 	fs.DurationVar(&f.callTimeout, "call-timeout", proxy.DefaultCallTimeout, "how long each request may wait for the upstreams")
 	fs.TextVar(&f.logLevel, "log-level", f.logLevel, "log level: debug, info, warn, or error")
 	fs.StringVar(&f.httpAddr, "http", "", "serve Streamable HTTP on this address (e.g. 127.0.0.1:8080) in place of stdio; non-loopback addresses need TLS or -behind-tls-proxy")
@@ -111,6 +114,9 @@ func parseFlags(args []string, stderr io.Writer) (flags, error) {
 	}
 	if f.configPath == "" {
 		return flags{}, usageFailure(fs, "missing -config")
+	}
+	if f.policyPath == "" {
+		return flags{}, usageFailure(fs, "missing -policy; every call is checked against a policy file")
 	}
 	if fs.NArg() > 0 {
 		return flags{}, usageFailure(fs, "unexpected arguments; upstreams are listed in the -config file")
@@ -146,6 +152,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return err
 	}
 	cfg, err := config.Load(f.configPath)
+	if err != nil {
+		return err
+	}
+	pol, err := loadPolicy(f, cfg)
 	if err != nil {
 		return err
 	}
@@ -205,7 +215,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	if err != nil {
 		return errors.Join(err, group.Close())
 	}
-	p := proxy.New(rt, proxy.Options{
+	guard := policy.NewGuard(rt, rt, pol, logger.With("component", "policy"))
+	p := proxy.New(guard, proxy.Options{
 		CallTimeout: f.callTimeout,
 		Logger:      logger.With("component", "proxy"),
 		Progress:    tracker,
@@ -214,7 +225,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 
 	var serveErr error
 	if f.httpAddr != "" {
-		serveErr = serveHTTP(ctx, rt, authn, tracker, group, f, tlsConfig, logger)
+		serveErr = serveHTTP(ctx, guard, authn, tracker, group, f, tlsConfig, logger)
 	} else {
 		serveErr = serve(ctx, p, group, stdin, stdout)
 	}
@@ -230,6 +241,27 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	}
 	logger.Info("gateway stopped")
 	return errors.Join(serveErr, closeErr)
+}
+
+// loadPolicy reads the policy and checks it against the config, so a rule
+// for a misspelled upstream or an agent with no key stops startup.
+func loadPolicy(f flags, cfg *config.Config) (*policy.Policy, error) {
+	pol, err := policy.Load(f.policyPath)
+	if err != nil {
+		return nil, err
+	}
+	upstreams := make([]string, len(cfg.Upstreams))
+	for i, u := range cfg.Upstreams {
+		upstreams[i] = u.Name
+	}
+	agents := make([]string, len(cfg.Agents))
+	for i, a := range cfg.Agents {
+		agents[i] = a.Name
+	}
+	if err := pol.CheckNames(upstreams, agents); err != nil {
+		return nil, fmt.Errorf("policy %s does not match config %s: %w", f.policyPath, f.configPath, err)
+	}
+	return pol, nil
 }
 
 func agentEntries(cfg *config.Config) []auth.Entry {

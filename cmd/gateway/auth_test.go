@@ -47,7 +47,7 @@ func TestRunStdioNeedsAValidKeyBeforeStartingUpstreams(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var stderr bytes.Buffer
-			err := run(context.Background(), []string{"-config", cfg}, strings.NewReader(""), io.Discard, &stderr, envWithKey(tt.key))
+			err := run(context.Background(), withPolicy([]string{"-config", cfg}), strings.NewReader(""), io.Discard, &stderr, envWithKey(tt.key))
 			if !errors.Is(err, tt.wantErr) || !strings.Contains(err.Error(), apiKeyEnv) {
 				t.Fatalf("run() error = %v, want %v naming %s", err, tt.wantErr, apiKeyEnv)
 			}
@@ -111,7 +111,7 @@ func TestRunHTTPIgnoresTheStdioKey(t *testing.T) {
 	defer cancel()
 	g := &gateway{t: t, done: make(chan error, 1), stderr: &syncBuffer{}}
 	go func() {
-		g.done <- run(ctx, []string{"-config", fakeConfig(t, "fake"), "-http", "127.0.0.1:0"}, strings.NewReader(""), io.Discard, g.stderr, envWithKey(""))
+		g.done <- run(ctx, withPolicy([]string{"-config", fakeConfig(t, "fake"), "-http", "127.0.0.1:0"}), strings.NewReader(""), io.Discard, g.stderr, envWithKey(""))
 	}()
 	url := waitForHTTP(t, g.stderr)
 	if status, _ := postMCP(t, url, "tools/list", "", `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{`+validMeta+`}}`); status != http.StatusOK {
@@ -196,7 +196,13 @@ func TestBinaryKeygenThenConnect(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	gw := exec.Command(gatewayBin, "-config", path)
+	policyText := "roles:\n  all:\n    allow:\n      - tool: fake__*\nagents:\n  desktop: [all]\n"
+	policyPath := filepath.Join(filepath.Dir(path), "policy.yaml")
+	if err := os.WriteFile(policyPath, []byte(policyText), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	gw := exec.Command(gatewayBin, "-config", path, "-policy", policyPath)
 	gw.Env = append(os.Environ(), apiKeyEnv+"="+key)
 	gw.Stdin = strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{` + validMeta + `}}` + "\n")
 	var out, logs bytes.Buffer
@@ -213,7 +219,7 @@ func TestBinaryKeygenThenConnect(t *testing.T) {
 }
 
 func TestBinaryStdioWithoutKeyExits1(t *testing.T) {
-	gw := exec.Command(gatewayBin, "-config", fakeConfig(t, "fake"))
+	gw := exec.Command(gatewayBin, withPolicy([]string{"-config", fakeConfig(t, "fake")})...)
 	gw.Env = append(os.Environ(), apiKeyEnv+"=")
 	var logs bytes.Buffer
 	gw.Stderr = &logs

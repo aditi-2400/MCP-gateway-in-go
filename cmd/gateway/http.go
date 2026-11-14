@@ -12,8 +12,8 @@ import (
 
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/auth"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/httpfront"
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/policy"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/progress"
-	"github.com/aditi-2400/MCP-gateway-in-go/internal/router"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/upstream"
 )
 
@@ -93,7 +93,7 @@ func loadTLS(f flags) (*tls.Config, error) {
 }
 
 // serveHTTP serves on f.httpAddr, over TLS if tlsConfig is set.
-func serveHTTP(ctx context.Context, rt *router.Router, authn *auth.Authenticator, tracker *progress.Tracker, group *upstream.Group, f flags, tlsConfig *tls.Config, logger *slog.Logger) error {
+func serveHTTP(ctx context.Context, guard *policy.Guard, authn *auth.Authenticator, tracker *progress.Tracker, group *upstream.Group, f flags, tlsConfig *tls.Config, logger *slog.Logger) error {
 
 	ln, err := net.Listen("tcp", f.httpAddr)
 	if err != nil {
@@ -101,13 +101,13 @@ func serveHTTP(ctx context.Context, rt *router.Router, authn *auth.Authenticator
 	}
 	srv := &http.Server{
 		TLSConfig: tlsConfig,
-		Handler: httpfront.New(rt, httpfront.Options{
+		Handler: httpfront.New(guard, httpfront.Options{
 			Auth:           authn,
 			AllowedOrigins: f.allowedOrigins,
 			CallTimeout:    f.callTimeout,
 			Logger:         logger.With("component", "http"),
 			Progress:       tracker,
-			Schemas:        rt,
+			Schemas:        guard,
 		}),
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       readTimeout,

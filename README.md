@@ -4,7 +4,7 @@ A gateway that sits between AI agents and MCP servers.
 
 Agents connect to the gateway as if it were a single MCP server. Behind it, the gateway connects to many upstream MCP servers (filesystem, database, GitHub, and so on). Every tool call goes through the gateway, so it can decide who may call which tool, how often, and with which arguments. It logs every call.
 
-> Status: the gateway runs over stdio or Streamable HTTP in front of several upstream MCP servers, merges their tools under prefixed names, and routes each tool call to the right server. Every caller needs an API key. Policy, rate limits, and audit are not built yet, so any authenticated agent can call every tool.
+> Status: the gateway runs over stdio or Streamable HTTP in front of several upstream MCP servers, merges their tools under prefixed names, and routes each tool call to the right server. Every caller needs an API key, and a policy file decides which tools each agent can see and call, with checks on the arguments. Rate limits and audit are not built yet.
 
 ## Why
 
@@ -24,9 +24,9 @@ The gateway targets MCP spec **2026-07-28** only. In this version there is no `i
 ## How it works today
 
 ```
-client ──stdin/stdout──▶ proxy ─────┐               ┌──▶ upstream "fs"     (child process)
-                                    ├──▶ router ────┤
-client ──HTTP POST /mcp──▶ httpfront┘               └──▶ upstream "github" (child process)
+client ──stdin/stdout──▶ proxy ─────┐                         ┌──▶ upstream "fs"     (child process)
+                                    ├──▶ policy ──▶ router ───┤
+client ──HTTP POST /mcp──▶ httpfront┘                         └──▶ upstream "github" (child process)
 ```
 
 One gateway process serves either stdio or HTTP, picked with the `-http` flag.
@@ -40,6 +40,7 @@ One gateway process serves either stdio or HTTP, picked with the `-http` flag.
 - **`internal/httpfront`** serves Streamable HTTP for 2026-07-28. Every message is its own `POST /mcp`, with no sessions. It checks `Origin` against an allowlist, checks that the `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, and `Mcp-Param-*` headers match the body, and answers with the spec's status codes. Closing the connection cancels the request.
 - **`internal/progress`** sends upstream progress notifications back to the request that asked for them. Clients choose their own progress tokens, so two clients can pick the same one; the gateway gives each upstream request its own token and maps it back, the same way it does with request IDs. Over HTTP, progress arrives as an SSE stream.
 - **`internal/router`** decides what each request does. It answers `server/discover` itself and checks the protocol version on every request. `tools/list` asks every upstream at once and returns one list with names like `fs__read_file`. If one upstream fails, its tools are left out and the rest are still listed. `tools/call` goes to the upstream named by the prefix, with the prefix removed. Other methods get "method not found" for now.
+- **`internal/policy`** loads the policy file and sits in front of the router. It reads the agent that auth attached to the request, hides tools the agent may not call from `tools/list`, and checks every `tools/call` before it reaches the router. Methods it has no rule for are refused, so a method added to the router later can't skip the policy by accident.
 - **`internal/fakeupstream`** is a small MCP server with `echo`, `add`, and `fail` tools, used in tests.
 
 When an upstream doesn't reply, the client gets a JSON-RPC error (`-32603`) saying "upstream timed out", "upstream unavailable", or "upstream error". The details go to the log only. Calls are never retried.
@@ -52,7 +53,7 @@ When an upstream doesn't reply, the client gets a JSON-RPC error (`-32603`) sayi
 | Multiple upstreams | Merges tools from several servers and prefixes names (`fs__read_file`) so they don't collide | Built |
 | Transports | stdio (for local clients like Claude Desktop) and Streamable HTTP, with optional TLS | Built |
 | Auth | API keys per agent, stored hashed | Built |
-| Policy engine | YAML rules, default deny, argument checks like path prefixes and blocked SQL | Planned |
+| Policy engine | YAML rules, default deny, argument checks like path prefixes and blocked SQL | Built |
 | Rate limiting | Token bucket per agent and per tool | Planned |
 | Audit log | Append-only JSON in SQLite with redacted arguments | Planned |
 | Observability | Prometheus metrics and OpenTelemetry traces | Planned |
@@ -80,8 +81,8 @@ internal/mcp/           protocol version and _meta checks
 internal/router/        discover, merged tools/list, tools/call routing
 internal/httpfront/     Streamable HTTP endpoint and header checks
 internal/progress/      progress token rewriting and routing
-internal/auth/          API key identification (planned)
-internal/policy/        rules engine, YAML loading (planned)
+internal/auth/          API key identification
+internal/policy/        rules, argument checks, and the guard in front of the router
 internal/ratelimit/     per-agent, per-tool limits (planned)
 internal/audit/         append-only structured log (planned)
 internal/metrics/       Prometheus and OpenTelemetry (planned)
@@ -109,10 +110,10 @@ make build    # builds bin/gateway
 ## Run
 
 ```sh
-gateway -config gateway.yaml [-call-timeout 60s] [-log-level info]
-gateway -config gateway.yaml -http 127.0.0.1:8080 [-allow-origin http://localhost:3000]...
-gateway -config gateway.yaml -http 0.0.0.0:8443 -tls-cert cert.pem -tls-key key.pem
-gateway -config gateway.yaml -http :8080 -behind-tls-proxy
+gateway -config gateway.yaml -policy policy.yaml [-call-timeout 60s] [-log-level info]
+gateway -config gateway.yaml -policy policy.yaml -http 127.0.0.1:8080 [-allow-origin http://localhost:3000]...
+gateway -config gateway.yaml -policy policy.yaml -http 0.0.0.0:8443 -tls-cert cert.pem -tls-key key.pem
+gateway -config gateway.yaml -policy policy.yaml -http :8080 -behind-tls-proxy
 gateway keygen -agent NAME
 ```
 
@@ -127,7 +128,7 @@ upstreams:
     args: ["--root", "/tmp/agent-workspace"]
 
 agents:
-  - name: ci-bot                  # who is calling; used by policy later
+  - name: ci-bot                  # who is calling; the policy refers to this name
     key_sha256: <SHA-256 of the agent's API key, 64 lowercase hex characters>
 ```
 
@@ -142,7 +143,7 @@ At least one agent is required. The file holds only the SHA-256 of each API key,
   ```json
   {"mcpServers": {"gateway": {
     "command": "/path/to/bin/gateway",
-    "args": ["-config", "/path/to/gateway.yaml"],
+    "args": ["-config", "/path/to/gateway.yaml", "-policy", "/path/to/policy.yaml"],
     "env": {"MCP_GATEWAY_API_KEY": "mcpgw_..."}
   }}}
   ```
@@ -151,25 +152,65 @@ At least one agent is required. The file holds only the SHA-256 of each API key,
 
 The key stops at the gateway. Upstreams never see it, and logs name the agent, never the key.
 
-Commands run directly, not through a shell. Only the command is logged, since arguments can hold tokens. Exit codes: 0 for a normal stop, 1 if the config is bad or an upstream fails or exits, 2 for a bad command line.
+### Policy
 
-To try it with the fake server ([`testdata/config/example.yaml`](testdata/config/example.yaml) names it `fake`):
+`-policy` is required. The policy file says which agent may call which tool, and everything it doesn't allow is denied:
+
+```yaml
+roles:
+  reader:
+    allow:
+      - tool: github__*            # every tool of one upstream
+      - tool: fs__read_file        # one tool, any arguments
+  writer:
+    allow:
+      - tool: fs__write_file
+        args:                      # only these arguments may be sent
+          path:    { path_prefix: [/tmp/agent-workspace] }
+          content: { max_length: 100000 }
+          mode:    {}              # allowed with any value, or left out
+      - tool: db__query
+        args:
+          sql: { deny_patterns: ['\bdrop\b', '\btruncate\b'] }
+
+agents:
+  ci-bot: [reader]
+  analyst: [reader, writer]
+```
+
+- An agent sees only the tools it may call in `tools/list`. A call to any other tool gets the same `Unknown tool` error as a tool that doesn't exist, so agents can't probe for hidden tools.
+- `*` only works as the whole tool part (`github__*`). Patterns like `fs__read_*` are rejected, because they would also match tools an upstream adds later.
+- An argument with checks must be sent, because the upstream's default for a missing argument could be anything. A rule with `args:` denies arguments it doesn't list.
+- `path_prefix` paths must be absolute. They are cleaned before the check, so `/tmp/agent-workspace/../../etc/passwd` counts as `/etc/passwd`. Whole folder names are compared, so `/tmp/agent-workspace-evil` doesn't match. Null bytes and backslashes are denied.
+- `deny_patterns` are Go regular expressions, always matched without regard to case. `max_length` counts bytes.
+- Arguments with a repeated key or invalid UTF-8 are denied, so the gateway can't check one value while the upstream reads another.
+- When arguments fail a check, the agent gets a tool result with `isError: true`, like `Denied by gateway policy: argument "path" is outside the allowed folders`. The spec says clients should show these to the model, so it can try again. The message never includes the folders, the patterns, or the argument's value. The log line names the agent, the tool, the role, and which pattern matched.
+- If the policy file is missing, invalid, or names an upstream or agent the config doesn't have, the gateway refuses to start. If the guard can't check something, the call is denied.
+
+Limits to know about:
+
+- Paths are checked as text. The gateway can't follow symlinks, because the files are on the upstream's side. `%2e%2e` isn't decoded, since the filesystem server won't decode it either.
+- A SQL blocklist is easy to get around: `DR/**/OP TABLE` splits the keyword with a comment and passes `\bdrop\b`. Use it as a guard rail only. The real protection is a database user that can only read.
+
+Commands run directly, not through a shell. Only the command is logged, since arguments can hold tokens. Exit codes: 0 for a normal stop, 1 if the config or policy is bad or an upstream fails or exits, 2 for a bad command line.
+
+To try it with the fake server and [`testdata/config/example-policy.yaml`](testdata/config/example-policy.yaml), which lets the agent `example` call `fake__echo`, `fake__add`, and `fake__count`:
 
 ```sh
 make build
 go build -o bin/fakeupstream ./testdata/fakeupstream
-cp testdata/config/example.yaml bin/my.yaml
+printf 'upstreams:\n  - name: fake\n    command: ./bin/fakeupstream\nagents:\n' > bin/my.yaml
 # The key goes into the variable; the agent lines are appended to the config.
-export MCP_GATEWAY_API_KEY="$(./bin/gateway keygen -agent me 2>>bin/my.yaml)"
-echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fake__add","arguments":{"a":2,"b":3},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}' | ./bin/gateway -config bin/my.yaml
+export MCP_GATEWAY_API_KEY="$(./bin/gateway keygen -agent example 2>>bin/my.yaml)"
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fake__add","arguments":{"a":2,"b":3},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}' | ./bin/gateway -config bin/my.yaml -policy testdata/config/example-policy.yaml
 ```
 
-The reply on stdout includes `"structuredContent":{"sum":5}`. Log lines go to stderr. `make run` does the same with a fresh key each time and lets you type requests in.
+The reply on stdout includes `"structuredContent":{"sum":5}`. Log lines go to stderr. Change the tool to `fake__fail` and the reply is `Unknown tool: fake__fail`, with a `call denied` line in the log. `make run` starts the gateway with a fresh key and a policy that allows every fake tool, and lets you type requests in.
 
 Over HTTP:
 
 ```sh
-./bin/gateway -config bin/my.yaml -http 127.0.0.1:8080 &
+./bin/gateway -config bin/my.yaml -policy testdata/config/example-policy.yaml -http 127.0.0.1:8080 &
 curl -s http://127.0.0.1:8080/mcp \
   -H "Authorization: Bearer $MCP_GATEWAY_API_KEY" \
   -H 'Content-Type: application/json' -H 'MCP-Protocol-Version: 2026-07-28' \
