@@ -41,3 +41,15 @@ func TestEmptyNote(t *testing.T) {
 		t.Errorf("Get() = %+v, want empty", got)
 	}
 }
+
+func TestEnsureSharesTheNoteAlreadyThere(t *testing.T) {
+	outer, n := Ensure(context.Background())
+	inner, m := Ensure(outer)
+	if m != n {
+		t.Fatal("Ensure made a second note when one was already in the context")
+	}
+	Deny(inner, "no")
+	if got := n.Get(); got.Decision != Denied {
+		t.Errorf("outer note = %+v, want the inner layer's decision", got)
+	}
+}

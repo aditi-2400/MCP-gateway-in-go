@@ -1,7 +1,8 @@
 // Package note lets the layers a tools/call passes through tell the audit
 // log what they decided. The audit layer puts an empty Note in the request
 // context; the policy guard, the rate limiter, and the upstream timer fill
-// it in. Outside an audited call the functions do nothing.
+// it in. A tracing layer outside the audit layer may add the note first
+// (Ensure) to read it too. Outside an audited call the functions do nothing.
 //
 // It is its own package, with no dependencies, so the policy and rate limit
 // packages can use it without pulling in the audit store.
@@ -48,6 +49,16 @@ type key struct{}
 func New(ctx context.Context) (context.Context, *Note) {
 	n := &Note{}
 	return context.WithValue(ctx, key{}, n), n
+}
+
+// Ensure returns the Note already in ctx, or adds a new one. A layer outside
+// the audit layer (tracing) can add the note first and read the same
+// decisions the audit log records.
+func Ensure(ctx context.Context) (context.Context, *Note) {
+	if n := from(ctx); n != nil {
+		return ctx, n
+	}
+	return New(ctx)
 }
 
 func from(ctx context.Context) *Note {

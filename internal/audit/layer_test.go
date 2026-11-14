@@ -321,3 +321,23 @@ func TestLayerTellsTheObserver(t *testing.T) {
 		t.Errorf("refused = %d, want 1", obs.refused)
 	}
 }
+
+// A layer outside (tracing) may put the note in the context first. The audit
+// layer must write into that note, not a new one, or the outer layer never
+// sees the decision.
+func TestLayerSharesANoteAlreadyInTheContext(t *testing.T) {
+	store := &fakeStore{}
+	rec := NewRecorder(store, Options{})
+	layer := NewLayer(&scriptedNext{do: func(ctx context.Context) (*jsonrpc.Message, error) {
+		note.Deny(ctx, "no rule allows it")
+		return okResult(), nil
+	}}, rec, nil)
+	ctx, outer := note.Ensure(asAgent("ci-bot"))
+	if _, err := layer.Call(ctx, "tools/call", json.RawMessage(`{"name":"x__y"}`)); err != nil {
+		t.Fatal(err)
+	}
+	closeRecorder(t, rec)
+	if got := outer.Get(); got.Decision != note.Denied {
+		t.Errorf("outer note = %+v, want the decision made inside the audit layer", got)
+	}
+}

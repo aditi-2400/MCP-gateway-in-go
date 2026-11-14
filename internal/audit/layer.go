@@ -94,7 +94,7 @@ func (l *Layer) Call(ctx context.Context, method string, params json.RawMessage)
 		Tool:      tool,
 		Arguments: storedArguments(args),
 	}
-	ctx, n := note.New(ctx)
+	ctx, n := note.Ensure(ctx)
 	// Deferred, so the slot is committed even if a layer below panics;
 	// an uncommitted slot would never be freed.
 	defer func() {
