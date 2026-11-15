@@ -41,6 +41,10 @@ type Layer struct {
 	obs    Observer
 }
 
+// UnavailableMessage is the error message of a call refused because the
+// audit log had no room for it.
+const UnavailableMessage = "audit log unavailable"
+
 // Observer hears about every audited call, for metrics. It is called on the
 // request's goroutine, so it must be quick and must not block.
 type Observer interface {
@@ -82,7 +86,7 @@ func (l *Layer) Call(ctx context.Context, method string, params json.RawMessage)
 		}
 		l.logger.Error("refusing tools/call: audit log unavailable", "error", err)
 		l.obs.CallRefused()
-		return &jsonrpc.Message{Error: &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: "audit log unavailable"}}, nil
+		return &jsonrpc.Message{Error: &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: UnavailableMessage}}, nil
 	}
 
 	agent, _ := auth.FromContext(ctx)

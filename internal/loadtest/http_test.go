@@ -23,6 +23,8 @@ import (
 type mcpServer struct {
 	delay      time.Duration
 	fail       atomic.Bool // answer with an error reply
+	refuseEach int64       // refuse every refuseEach-th call like a full audit log
+	refuseTill time.Time   // refuse every call before this time
 	inFlight   atomic.Int64
 	maxSeen    atomic.Int64
 	calls      atomic.Int64
@@ -42,7 +44,7 @@ func (s *mcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	s.calls.Add(1)
+	call := s.calls.Add(1)
 	body, _ := io.ReadAll(r.Body)
 	s.firstMu.Lock()
 	if s.firstReq == nil {
@@ -56,6 +58,10 @@ func (s *mcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(body, &req)
 	w.Header().Set("Content-Type", "application/json")
+	if (s.refuseEach > 0 && call%s.refuseEach == 0) || time.Now().Before(s.refuseTill) {
+		w.Write([]byte(`{"jsonrpc":"2.0","id":` + string(req.ID) + `,"error":{"code":-32603,"message":"audit log unavailable"}}`))
+		return
+	}
 	if s.fail.Load() {
 		w.Write([]byte(`{"jsonrpc":"2.0","id":` + string(req.ID) + `,"error":{"code":-32602,"message":"Unknown tool"}}`))
 		return
@@ -229,5 +235,55 @@ func TestStartHTTPGatewayReportsAGatewayThatExits(t *testing.T) {
 	_, err := StartHTTPGateway(gatewayBin, []string{"-config", "/no/such/file"}, &stderr)
 	if err == nil {
 		t.Fatal("no error for a gateway that can't start")
+	}
+}
+
+// Refusals from a full audit log are counted, not treated as failures, and
+// never mixed into the rate or the latency.
+func TestConcurrentCountsRefusalsApart(t *testing.T) {
+	s := &mcpServer{delay: time.Millisecond, refuseEach: 4}
+	target := HTTPTarget{URL: startMCPServer(t, s), Key: "k", Tool: "fake__add"}
+	got, err := Concurrent(context.Background(), NewHTTPClient(4), target, 4, 20*time.Millisecond, 300*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Refused == 0 || got.Calls == 0 {
+		t.Fatalf("calls %d, refused %d; want both above zero", got.Calls, got.Refused)
+	}
+	// One call in four is refused, so about three answered per refusal.
+	if ratio := float64(got.Calls) / float64(got.Refused); ratio < 2 || ratio > 4 {
+		t.Errorf("calls %d, refused %d: want about 3 answered per refused", got.Calls, got.Refused)
+	}
+	if got.Latency.N != got.Calls {
+		t.Errorf("latency has %d samples, want only the %d answered calls", got.Latency.N, got.Calls)
+	}
+	if want := float64(got.Calls) / 0.3; got.PerSecond != want {
+		t.Errorf("PerSecond = %v, want answered calls / window = %v", got.PerSecond, want)
+	}
+}
+
+// Only the audit log's refusal is counted; any other internal error stops.
+func TestConcurrentStopsOnOtherInternalErrors(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"upstream exited"}}`))
+	}))
+	t.Cleanup(ts.Close)
+	_, err := Concurrent(context.Background(), NewHTTPClient(1), HTTPTarget{URL: ts.URL, Key: "k", Tool: "t"}, 1, 0, time.Second)
+	if err == nil || !strings.Contains(err.Error(), "upstream exited") {
+		t.Errorf("error = %v, want the internal error", err)
+	}
+}
+
+// Refusals during warm-up aren't counted, just like warm-up calls.
+func TestConcurrentIgnoresRefusalsDuringWarmUp(t *testing.T) {
+	s := &mcpServer{delay: time.Millisecond, refuseTill: time.Now().Add(100 * time.Millisecond)}
+	target := HTTPTarget{URL: startMCPServer(t, s), Key: "k", Tool: "fake__add"}
+	got, err := Concurrent(context.Background(), NewHTTPClient(2), target, 2, 200*time.Millisecond, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Refused != 0 || got.Calls == 0 {
+		t.Errorf("calls %d, refused %d; want refusals only in warm-up, so none counted", got.Calls, got.Refused)
 	}
 }

@@ -1,4 +1,4 @@
-.PHONY: all build test vet fmt fmt-check check run clean
+.PHONY: all build test vet fmt fmt-check check run bench clean
 
 BIN_DIR := bin
 GATEWAY := $(BIN_DIR)/gateway
@@ -39,6 +39,16 @@ run: build
 	@printf 'upstreams:\n  - name: fake\n    command: ./bin/fakeupstream\nagents:\n' > $(BIN_DIR)/run.yaml
 	@printf 'roles:\n  all:\n    allow:\n      - tool: fake__*\nagents:\n  dev: [all]\nlimits:\n  default: { rate: 60/minute, burst: 10 }\n' > $(BIN_DIR)/run-policy.yaml
 	@MCP_GATEWAY_API_KEY="$$($(GATEWAY) keygen -agent dev 2>>$(BIN_DIR)/run.yaml)" $(GATEWAY) -config $(BIN_DIR)/run.yaml -policy $(BIN_DIR)/run-policy.yaml -audit-db $(BIN_DIR)/audit.db
+
+# Measures the gateway (see cmd/loadtest) and saves every result as JSON in
+# bench/results, named by the UTC time it started. Takes a few minutes; close
+# other busy programs first. go build stamps the git commit into loadtest,
+# so the results say which code was measured.
+bench: build
+	go build -o $(BIN_DIR)/fakeupstream ./testdata/fakeupstream
+	go build -o $(BIN_DIR)/loadtest ./cmd/loadtest
+	@mkdir -p bench/results
+	$(BIN_DIR)/loadtest -out bench/results/$$(date -u +%Y%m%dT%H%M%SZ).json
 
 clean:
 	rm -rf $(BIN_DIR)

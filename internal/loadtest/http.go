@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aditi-2400/MCP-gateway-in-go/internal/audit"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
 )
 
@@ -33,10 +34,15 @@ type HTTPTarget struct {
 	Tool string // the add tool's name at the gateway
 }
 
+// ErrRefused means the gateway refused a call because its audit log had no
+// room: it fails closed when calls come in faster than it can record them.
+var ErrRefused = errors.New("refused: " + audit.UnavailableMessage)
+
 // Throughput is the result of one Concurrent run.
 type Throughput struct {
 	Clients   int           `json:"clients"`
-	Calls     int           `json:"calls"`         // calls started in the window
+	Calls     int           `json:"calls"`         // answered calls started in the window
+	Refused   int           `json:"refused"`       // calls refused in the window (ErrRefused)
 	Window    time.Duration `json:"window_ns"`     // how long calls were counted
 	PerSecond float64       `json:"calls_per_sec"` // Calls / Window
 	Latency   Summary       `json:"latency"`
@@ -59,8 +65,11 @@ func NewHTTPClient(clients int) *http.Client {
 // counted. Then it counts every call started in the next window, and
 // stops starting new ones.
 //
-// The first failed call stops every client and is returned: a non-200
-// status, an error reply, or a tool result with isError.
+// Calls the gateway refuses with ErrRefused are counted in Refused and
+// left out of Calls, PerSecond, and Latency: a refusal comes back at once,
+// so counting it would make the gateway look faster. Any other failed call
+// stops every client and is returned: a non-200 status, an error reply, or
+// a tool result with isError.
 func Concurrent(ctx context.Context, client *http.Client, target HTTPTarget, clients int, warmup, window time.Duration) (Throughput, error) {
 	if clients <= 0 || warmup < 0 || window <= 0 {
 		return Throughput{}, fmt.Errorf("loadtest: need clients > 0, warmup >= 0, window > 0; got %d, %v, %v", clients, warmup, window)
@@ -72,6 +81,7 @@ func Concurrent(ctx context.Context, client *http.Client, target HTTPTarget, cli
 	measureFrom := time.Now().Add(warmup)
 	stopAt := measureFrom.Add(window)
 	perClient := make([][]time.Duration, clients)
+	refused := make([]int, clients)
 	var wg sync.WaitGroup
 	for c := range clients {
 		wg.Add(1)
@@ -82,12 +92,19 @@ func Concurrent(ctx context.Context, client *http.Client, target HTTPTarget, cli
 				if !start.Before(stopAt) {
 					return
 				}
-				if err := postCall(ctx, client, target, nextID.Add(1)); err != nil {
+				err := postCall(ctx, client, target, nextID.Add(1))
+				took := time.Since(start)
+				inWindow := !start.Before(measureFrom)
+				switch {
+				case errors.Is(err, ErrRefused):
+					if inWindow {
+						refused[c]++
+					}
+				case err != nil:
 					cancel(err)
 					return
-				}
-				if !start.Before(measureFrom) {
-					perClient[c] = append(perClient[c], time.Since(start))
+				case inWindow:
+					perClient[c] = append(perClient[c], took)
 				}
 			}
 		}()
@@ -98,12 +115,15 @@ func Concurrent(ctx context.Context, client *http.Client, target HTTPTarget, cli
 	}
 
 	var all []time.Duration
-	for _, times := range perClient {
+	totalRefused := 0
+	for c, times := range perClient {
 		all = append(all, times...)
+		totalRefused += refused[c]
 	}
 	return Throughput{
 		Clients:   clients,
 		Calls:     len(all),
+		Refused:   totalRefused,
 		Window:    window,
 		PerSecond: float64(len(all)) / window.Seconds(),
 		Latency:   Summarize(all),
@@ -141,6 +161,9 @@ func postCall(ctx context.Context, client *http.Client, target HTTPTarget, id in
 	msg, err := jsonrpc.Parse(data)
 	if err != nil {
 		return fmt.Errorf("reply %q: %w", data, err)
+	}
+	if msg.Error != nil && msg.Error.Code == jsonrpc.CodeInternalError && msg.Error.Message == audit.UnavailableMessage {
+		return ErrRefused
 	}
 	return checkReply(msg, nil)
 }
