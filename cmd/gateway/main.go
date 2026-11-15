@@ -7,6 +7,7 @@
 //	gateway -config gateway.yaml -policy policy.yaml [-call-timeout 60s] [-log-level info]
 //	gateway -config gateway.yaml -policy policy.yaml -http 127.0.0.1:8080 [-allow-origin URL]...
 //	gateway ... -metrics 127.0.0.1:9090
+//	gateway ... -trace     (collector from OTEL_EXPORTER_OTLP_ENDPOINT)
 //	gateway keygen -agent NAME
 //	gateway audit -db audit.db [-agent NAME] [-tool NAME] [-decision D] [-since 1h] [-json]
 //
@@ -38,7 +39,6 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel/trace"
-	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/audit"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/auth"
@@ -97,6 +97,7 @@ type flags struct {
 	behindTLSProxy     bool
 	metricsAddr        string // empty means no metrics
 	metricsAllowRemote bool
+	trace              bool
 }
 
 // stringList is a flag that can be given more than once.
@@ -132,6 +133,7 @@ func parseFlags(args []string, stderr io.Writer) (flags, error) {
 	fs.BoolVar(&f.behindTLSProxy, "behind-tls-proxy", false, "allow plain HTTP on a non-loopback address because a proxy in front terminates TLS")
 	fs.StringVar(&f.metricsAddr, "metrics", "", "serve Prometheus metrics at /metrics on this address (e.g. 127.0.0.1:9090); loopback only unless -metrics-allow-remote")
 	fs.BoolVar(&f.metricsAllowRemote, "metrics-allow-remote", false, "allow -metrics on a non-loopback address; the endpoint has no authentication")
+	fs.BoolVar(&f.trace, "trace", false, "send OpenTelemetry traces over OTLP/HTTP; the collector address comes from OTEL_EXPORTER_OTLP_ENDPOINT (default https://localhost:4318)")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -252,6 +254,11 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return errors.Join(recorder.Close(flushCtx), store.Close())
 	}
 
+	tracer, stopTracing, err := startTracing(f.trace, logger.With("component", "tracing"))
+	if err != nil {
+		return errors.Join(err, closeAudit())
+	}
+
 	// Upstream read loops start inside StartGroup, but the proxy can only be
 	// built after it. Notifications that arrive before the proxy exists are
 	// dropped, the same as when no client is connected.
@@ -276,6 +283,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		Stderr:         stderr,
 	})
 	if err != nil {
+		stopTracing()
 		return errors.Join(err, closeAudit())
 	}
 	for _, u := range cfg.Upstreams {
@@ -288,11 +296,11 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	// untrusted, before anything reaches an upstream. Span names need the
 	// router's tool list, and the router is built from the wrapped upstreams,
 	// so knownTool reads rt once it is set; no call runs before that.
-	tracer := noop.NewTracerProvider().Tracer("")
 	var rt *router.Router
 	knownTool := func(name string) bool { return rt.KnownTool(name) }
 	rt, err = router.New(routes(group, tracer, knownTool), router.Options{Logger: logger.With("component", "router")})
 	if err != nil {
+		stopTracing()
 		return errors.Join(err, closeAudit(), group.Close())
 	}
 	// A request passes audit, policy, rate limit, the upstream timer, then the
@@ -303,7 +311,13 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	limited := ratelimit.NewEnforcer(timed, pol, ratelimit.New(time.Now), logger.With("component", "ratelimit"))
 	guard := policy.NewGuard(limited, rt, pol, logger.With("component", "policy"))
 	audited := audit.NewLayer(guard, recorder, logger.With("component", "audit"))
-	p := proxy.New(audited, proxy.Options{
+	// With -trace, a span covers each request from before the audit layer, so
+	// it includes any wait for room in the audit queue.
+	var handler proxy.Handler = audited
+	if f.trace {
+		handler = tracing.NewLayer(audited, tracer, rt.KnownTool)
+	}
+	p := proxy.New(handler, proxy.Options{
 		CallTimeout: f.callTimeout,
 		Logger:      logger.With("component", "proxy"),
 		Progress:    tracker,
@@ -320,7 +334,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 
 	var serveErr error
 	if f.httpAddr != "" {
-		serveErr = serveHTTP(ctx, audited, guard, authn, tracker, group, f, tlsConfig, logger)
+		serveErr = serveHTTP(ctx, handler, guard, authn, tracker, group, f, tlsConfig, logger)
 	} else {
 		serveErr = serve(ctx, p, group, stdin, stdout)
 	}
@@ -336,6 +350,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 			logger.Warn("metrics shutdown", "error", metricsErr)
 		}
 	}
+	// Every span has ended, so send what is still buffered.
+	stopTracing()
 
 	// Every call has finished, so flush the audit log before stopping
 	// upstreams, in case stopping them hangs.

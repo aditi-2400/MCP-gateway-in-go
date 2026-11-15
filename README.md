@@ -4,7 +4,7 @@ A gateway that sits between AI agents and MCP servers.
 
 Agents connect to the gateway as if it were a single MCP server. Behind it, the gateway connects to many upstream MCP servers (filesystem, database, GitHub, and so on). Every tool call goes through the gateway, so it can decide who may call which tool, how often, and with which arguments. It logs every call.
 
-> Status: the gateway runs over stdio or Streamable HTTP in front of several upstream MCP servers, merges their tools under prefixed names, and routes each tool call to the right server. Every caller needs an API key, and a policy file decides which tools each agent can see and call, with checks on the arguments and a rate limit per agent and tool. Every tool call is recorded in a SQLite audit log, with secrets taken out of the arguments. With `-metrics`, it also serves Prometheus metrics.
+> Status: the gateway runs over stdio or Streamable HTTP in front of several upstream MCP servers, merges their tools under prefixed names, and routes each tool call to the right server. Every caller needs an API key, and a policy file decides which tools each agent can see and call, with checks on the arguments and a rate limit per agent and tool. Every tool call is recorded in a SQLite audit log, with secrets taken out of the arguments. With `-metrics`, it also serves Prometheus metrics, and with `-trace` it sends OpenTelemetry traces.
 
 ## Why
 
@@ -44,7 +44,7 @@ One gateway process serves either stdio or HTTP, picked with the `-http` flag.
 - **`internal/audit`** comes first for every `tools/call`. It reserves room in the audit queue before anything else runs, so a call that can't be recorded is refused. When the call ends it writes one entry, whatever happened. Entries go to SQLite in the background.
 - **`internal/ratelimit`** sits between the policy and the router, so calls the policy denies never use up tokens. Each agent has a token bucket per tool. A call that finds its bucket empty gets error `-31029` and never reaches the upstream.
 - **`internal/metrics`** counts tool calls, denials, and latency for Prometheus. The audit layer tells it about every call it finishes.
-- **`internal/tracing`** wraps every upstream connection. Clients may put trace context (`traceparent`, `tracestate`, `baggage`) in `_meta`, but it is untrusted, so the gateway removes it before a call reaches an upstream. OpenTelemetry tracing itself is not switched on yet.
+- **`internal/tracing`** records a span for each request (outside audit, so it covers the whole time in the gateway) and one for each upstream call. It also removes the trace context a client put in `_meta` before a call reaches an upstream, since that is untrusted.
 - **`internal/fakeupstream`** is a small MCP server with `echo`, `add`, and `fail` tools, used in tests.
 
 When an upstream doesn't reply, the client gets a JSON-RPC error (`-32603`) saying "upstream timed out", "upstream unavailable", or "upstream error". The details go to the log only. Calls are never retried.
@@ -60,7 +60,7 @@ When an upstream doesn't reply, the client gets a JSON-RPC error (`-32603`) sayi
 | Policy engine | YAML rules, default deny, argument checks like path prefixes and blocked SQL | Built |
 | Rate limiting | Token bucket per agent and per tool | Built |
 | Audit log | Append-only SQLite log of every tool call, with redacted arguments | Built |
-| Observability | Prometheus metrics and OpenTelemetry traces | Metrics built |
+| Observability | Prometheus metrics and OpenTelemetry traces | Built |
 | Resilience | Timeouts, circuit breakers, no automatic retries on tools with side effects | Timeouts built |
 | Description pinning | Hashes tool descriptions and quarantines a tool if its description changes | Planned |
 
@@ -90,6 +90,7 @@ internal/policy/        rules, argument checks, and the guard in front of the ro
 internal/ratelimit/     per-agent, per-tool token buckets
 internal/audit/         redaction, audit queue, SQLite store, and the audit layer
 internal/metrics/       Prometheus metrics, fed by the audit layer
+internal/tracing/       OpenTelemetry spans and trace context for upstream calls
 internal/pinning/       tool description hashing and quarantine (planned)
 testdata/fakeupstream/  entry point for the fake server binary
 ```
@@ -100,10 +101,12 @@ The fake server's logic lives in `internal/fakeupstream` so that `go test ./...`
 
 - Go 1.26 or newer
 
-Dependencies are tracked in `go.mod`. There are two:
+Dependencies are tracked in `go.mod`. There are four:
 
 - [`go.yaml.in/yaml/v4`](https://pkg.go.dev/go.yaml.in/yaml/v4) for the config and policy files, since Go's standard library has no YAML parser. It is the YAML organization's maintained version of go-yaml. The older `gopkg.in/yaml.v3` was marked unmaintained in 2025.
 - [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite) for the audit log. It is SQLite translated to Go, so builds need no C compiler. It is slower than the C version, which doesn't matter for a log written in the background. It brings in its own set of `modernc.org` packages.
+- [`prometheus/client_golang`](https://pkg.go.dev/github.com/prometheus/client_golang) for `/metrics`. Writing the Prometheus text format by hand is possible, but histograms and the Go runtime metrics are real work to get right.
+- [OpenTelemetry Go](https://pkg.go.dev/go.opentelemetry.io/otel) (`otel`, `otel/sdk`, and the OTLP/HTTP trace exporter) for tracing. The exporter shares generated code with the gRPC exporter, so it pulls in `google.golang.org/grpc` and makes the binary about 7 MB bigger (20.8 MB to 28.0 MB, measured), even though the gateway never opens a gRPC connection. We kept it because it is maintained and handles retries, TLS, and every `OTEL_EXPORTER_OTLP_*` setting.
 
 ## Build and test
 
@@ -122,6 +125,7 @@ gateway -config gateway.yaml -policy policy.yaml -audit-db audit.db -http 127.0.
 gateway -config gateway.yaml -policy policy.yaml -audit-db audit.db -http 0.0.0.0:8443 -tls-cert cert.pem -tls-key key.pem
 gateway -config gateway.yaml -policy policy.yaml -audit-db audit.db -http :8080 -behind-tls-proxy
 gateway -config gateway.yaml -policy policy.yaml -audit-db audit.db -metrics 127.0.0.1:9090 [-metrics-allow-remote]
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 gateway -config gateway.yaml -policy policy.yaml -audit-db audit.db -trace
 gateway keygen -agent NAME
 gateway audit -db audit.db [-agent NAME] [-tool NAME] [-decision D] [-since 1h] [-limit N] [-json]
 ```
@@ -291,6 +295,21 @@ Prometheus keeps one series per distinct label value, so every label comes from 
 ./bin/gateway -config bin/my.yaml -policy testdata/config/example-policy.yaml -audit-db bin/audit.db -http 127.0.0.1:8080 -metrics 127.0.0.1:9090 &
 curl -sS http://127.0.0.1:9090/metrics | grep '^mcpgw_'
 ```
+
+### Tracing
+
+`-trace` sends OpenTelemetry traces over OTLP/HTTP. It is off by default. Everything else comes from the standard OpenTelemetry environment variables:
+
+- `OTEL_EXPORTER_OTLP_ENDPOINT`: where to send them. The default is `https://localhost:4318`; a local collector without TLS needs `http://localhost:4318`.
+- `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG`: how many requests to keep. The default keeps all of them.
+- `OTEL_SERVICE_NAME`: the name in the trace viewer. The default is `mcp-gateway`.
+- `OTEL_EXPORTER_OTLP_HEADERS`: headers for a collector that needs a token.
+
+Each request gets a span named like `tools/call fs__read_file`, and each call the gateway makes to an upstream gets a span inside it, named like `tools/call read_file`. Spans carry the agent, tool, policy decision and reason, and `error.type`. They never carry arguments. Names and attributes follow the [OpenTelemetry conventions for MCP](https://github.com/open-telemetry/semantic-conventions-genai). The gateway puts its own `traceparent` in the `_meta` it sends upstream, so an upstream that traces too shows up under the gateway's span.
+
+A client can send its own trace context in `_meta`, but that is untrusted input: it could pick trace IDs or force every request to be recorded. So each request starts a new trace, with a link back to the client's trace. The client's `traceparent`, `tracestate`, and `baggage` are removed before a call goes upstream, with or without `-trace`.
+
+If the collector is down, tool calls work as usual. Failed sends are logged as warnings, and shutdown waits at most 5 seconds to send the last spans.
 
 ## Known limits
 
