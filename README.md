@@ -311,6 +311,18 @@ A client can send its own trace context in `_meta`, but that is untrusted input:
 
 If the collector is down, tool calls work as usual. Failed sends are logged as warnings, and shutdown waits at most 5 seconds to send the last spans.
 
+To look at traces locally, run [Jaeger](https://www.jaegertracing.io/) in Docker. It takes OTLP on port 4318 and shows traces at http://localhost:16686:
+
+```sh
+docker run --rm -d --name jaeger -p 16686:16686 -p 4318:4318 jaegertracing/jaeger:latest
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 bin/gateway -config gateway.yaml -policy policy.yaml -audit-db audit.db -trace
+```
+
+Pick `mcp-gateway` under Service and click Find Traces. Jaeger keeps traces in memory, so they are gone once you run `docker stop jaeger`. Two things to know:
+
+- The search only covers the Lookback window, "Last 1 hour" by default. Older traces are still there; make the window bigger to see them.
+- A span is named after its tool only once the gateway has fetched that upstream's tool list. Calls sent before that are named plain `tools/call`. The tool name is still in the `gen_ai.tool.name` attribute.
+
 ## Known limits
 
 - If an upstream stops reading its stdin, a write to it can block the caller.
