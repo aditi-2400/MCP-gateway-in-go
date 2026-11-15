@@ -29,7 +29,7 @@ func BenchmarkHTTPThroughput(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	args, err := loadtest.WriteGatewayFiles(b.TempDir(), fakeUpstreamBin, auth.HashKey(key))
+	args, err := loadtest.WriteGatewayFiles(b.TempDir(), fakeUpstreamBin, auth.HashKey(key), loadtest.PolicyMinimal)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func BenchmarkHTTPThroughput(b *testing.B) {
 		b.Fatalf("gateway did not start listening\n%s", stderr)
 	}
 
-	target := loadtest.HTTPTarget{URL: url, Key: key, Tool: loadtest.UpstreamName + "__add"}
+	target := loadtest.HTTPTarget{URL: url, Key: key, Tool: loadtest.UpstreamName + "__" + loadtest.Tool}
 	client := loadtest.NewHTTPClient(benchClients)
 	defer client.CloseIdleConnections()
 	for b.Loop() {

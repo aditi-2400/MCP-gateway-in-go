@@ -205,7 +205,7 @@ func TestStartHTTPGatewayServesCalls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	args, err := WriteGatewayFiles(t.TempDir(), fakeUpstreamBin, auth.HashKey(key))
+	args, err := WriteGatewayFiles(t.TempDir(), fakeUpstreamBin, auth.HashKey(key), PolicyMinimal)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +214,7 @@ func TestStartHTTPGatewayServesCalls(t *testing.T) {
 	if err != nil {
 		t.Fatalf("%v\n%s", err, stderr.String())
 	}
-	target := HTTPTarget{URL: gw.URL, Key: key, Tool: UpstreamName + "__add"}
+	target := HTTPTarget{URL: gw.URL, Key: key, Tool: UpstreamName + "__" + Tool}
 	got, err := Concurrent(context.Background(), NewHTTPClient(4), target, 4, 20*time.Millisecond, 200*time.Millisecond)
 	if err != nil {
 		t.Fatalf("%v\n%s", err, stderr.String())

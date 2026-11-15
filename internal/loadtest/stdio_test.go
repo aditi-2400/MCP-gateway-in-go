@@ -44,7 +44,7 @@ func runTests(m *testing.M) int {
 }
 
 func TestMeasureStdioDirect(t *testing.T) {
-	target := StdioTarget{Name: "direct", Command: upstream.Command{Path: fakeUpstreamBin}, Tool: "add"}
+	target := StdioTarget{Name: "direct", Command: upstream.Command{Path: fakeUpstreamBin}, Tool: Tool}
 	times, err := MeasureStdio(context.Background(), target, 5, 20, os.Stderr)
 	if err != nil {
 		t.Fatal(err)
@@ -58,12 +58,12 @@ func TestMeasureStdioDirect(t *testing.T) {
 // as the stdio key and the config's hash made from configKey.
 func gatewayTarget(t *testing.T, key, configKey string) StdioTarget {
 	t.Helper()
-	args, err := WriteGatewayFiles(t.TempDir(), fakeUpstreamBin, auth.HashKey(configKey))
+	args, err := WriteGatewayFiles(t.TempDir(), fakeUpstreamBin, auth.HashKey(configKey), PolicyMinimal)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv(KeyEnv, key)
-	return StdioTarget{Name: "gateway", Command: upstream.Command{Path: gatewayBin, Args: args}, Tool: UpstreamName + "__add"}
+	return StdioTarget{Name: "gateway", Command: upstream.Command{Path: gatewayBin, Args: args}, Tool: UpstreamName + "__" + Tool}
 }
 
 func TestMeasureStdioThroughTheGateway(t *testing.T) {
@@ -103,7 +103,7 @@ func TestMeasureStdioReportsAFailedExit(t *testing.T) {
 	target := StdioTarget{
 		Name:    "direct",
 		Command: upstream.Command{Path: "sh", Args: []string{"-c", `"$0"; exit 3`, fakeUpstreamBin}},
-		Tool:    "add",
+		Tool:    Tool,
 	}
 	_, err := MeasureStdio(context.Background(), target, 0, 5, os.Stderr)
 	if err == nil || !strings.Contains(err.Error(), "stop") {

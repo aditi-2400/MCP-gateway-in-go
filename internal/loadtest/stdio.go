@@ -23,10 +23,19 @@ const KeyEnv = "MCP_GATEWAY_API_KEY"
 // its tools are reached as UpstreamName + "__" + tool.
 const UpstreamName = "fake"
 
-// CallParams returns the params of a tools/call to the add tool, named tool
-// as the target knows it, the way a 2026-07-28 client sends them.
+// Tool is the fake upstream tool every benchmark call uses. echo takes a
+// string, so the realistic policy's path and pattern checks have something
+// to check.
+const Tool = "echo"
+
+// Text is the argument sent to Tool: a path inside the folder the realistic
+// policy allows.
+const Text = "/tmp/agent-workspace/notes/today.txt"
+
+// CallParams returns the params of a tools/call to Tool, named tool as the
+// target knows it, the way a 2026-07-28 client sends them.
 func CallParams(tool string) json.RawMessage {
-	return json.RawMessage(`{"name":"` + tool + `","arguments":{"a":1,"b":2},` +
+	return json.RawMessage(`{"name":"` + tool + `","arguments":{"text":"` + Text + `"},` +
 		`"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}`)
 }
 
@@ -35,7 +44,7 @@ func CallParams(tool string) json.RawMessage {
 type StdioTarget struct {
 	Name    string           // for results, e.g. "direct" or "gateway"
 	Command upstream.Command // how to start it
-	Tool    string           // the add tool's name as this target knows it
+	Tool    string           // Tool's name as this target knows it
 }
 
 // MeasureStdio starts target, runs Sequential against it, and stops it.
@@ -60,15 +69,15 @@ func MeasureStdio(ctx context.Context, target StdioTarget, warmup, n int, stderr
 
 // WriteGatewayFiles writes a gateway config and policy into dir for a
 // gateway in front of the upstream at upstreamPath, and returns the
-// gateway's arguments. Agent's key must hash to keyHash.
-//
-// The policy is the smallest one that allows the calls: every tool of the
-// upstream, with a limit too high to reach.
-func WriteGatewayFiles(dir, upstreamPath, keyHash string) ([]string, error) {
+// gateway's arguments. Agent's key must hash to keyHash. policyName is one
+// of Policies.
+func WriteGatewayFiles(dir, upstreamPath, keyHash, policyName string) ([]string, error) {
+	policy, ok := policies[policyName]
+	if !ok {
+		return nil, fmt.Errorf("unknown policy %q, want one of %v", policyName, Policies)
+	}
 	config := fmt.Sprintf("upstreams:\n  - name: %s\n    command: %q\nagents:\n  - name: %s\n    key_sha256: %s\n",
 		UpstreamName, upstreamPath, Agent, keyHash)
-	policy := fmt.Sprintf("roles:\n  all:\n    allow:\n      - tool: %s__*\nagents:\n  %s: [all]\n"+
-		"limits:\n  default: { rate: 1000000/second, burst: 1000000 }\n", UpstreamName, Agent)
 
 	configPath := filepath.Join(dir, "gateway.yaml")
 	policyPath := filepath.Join(dir, "policy.yaml")

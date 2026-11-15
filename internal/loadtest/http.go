@@ -31,7 +31,7 @@ const startupTimeout = 10 * time.Second
 type HTTPTarget struct {
 	URL  string // e.g. http://127.0.0.1:8080/mcp
 	Key  string // API key, sent as a Bearer token
-	Tool string // the add tool's name at the gateway
+	Tool string // Tool's name at the gateway
 }
 
 // ErrRefused means the gateway refused a call because its audit log had no

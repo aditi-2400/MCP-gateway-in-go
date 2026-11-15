@@ -1,7 +1,7 @@
 // Command loadtest measures how much time the gateway adds to a tool call,
 // and how many calls a second it handles.
 //
-// Each round calls the fake upstream's add tool over stdio, directly and
+// Each round calls the fake upstream's echo tool over stdio, directly and
 // through the gateway, one call at a time; the order flips every round so
 // neither side always runs on a warmer or cooler machine. Then it measures
 // calls per second over HTTP with several clients calling at once. At the
@@ -10,7 +10,8 @@
 //
 //	loadtest [-gateway bin/gateway] [-upstream bin/fakeupstream] [-rounds 5]
 //	         [-n 5000] [-warmup 500] [-clients 1,8,32] [-window 5s]
-//	         [-http-warmup 1s] [-out results.json]
+//	         [-http-warmup 1s] [-policy minimal]
+//	         [-out results.json]
 package main
 
 import (
@@ -25,6 +26,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -54,6 +56,7 @@ type options struct {
 	rounds, n, warmup       int
 	clients                 []int
 	window, httpWarmup      time.Duration
+	policy                  string
 	out                     string
 }
 
@@ -69,6 +72,7 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	clients := flags.String("clients", "1,8,32", "HTTP clients calling at once, one run per value; past about 64 the audit log fills on a laptop and calls are refused")
 	flags.DurationVar(&o.window, "window", 5*time.Second, "how long each HTTP run counts calls")
 	flags.DurationVar(&o.httpWarmup, "http-warmup", time.Second, "how long each HTTP run calls before counting")
+	flags.StringVar(&o.policy, "policy", loadtest.PolicyMinimal, "gateway policy: "+strings.Join(loadtest.Policies, " or "))
 	flags.StringVar(&o.out, "out", "", "save every result as JSON to this new file")
 	if err := flags.Parse(args); err != nil {
 		return o, err
@@ -78,6 +82,9 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	}
 	if o.rounds <= 0 {
 		return o, errors.New("-rounds must be at least 1")
+	}
+	if !slices.Contains(loadtest.Policies, o.policy) {
+		return o, fmt.Errorf("-policy %q: want one of %s", o.policy, strings.Join(loadtest.Policies, ", "))
 	}
 	var err error
 	if o.clients, err = parseClients(*clients); err != nil {
@@ -118,20 +125,14 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		Machine: loadtest.ThisMachine(),
 		Settings: loadtest.Settings{
 			Calls: o.n, Warmup: o.warmup, Clients: o.clients,
-			Window: o.window, HTTPWarmup: o.httpWarmup, Policy: "minimal",
+			Window: o.window, HTTPWarmup: o.httpWarmup, Policy: o.policy,
 		},
 	}
 	m := report.Machine
 	fmt.Fprintf(stdout, "%s, %d CPUs, %s/%s, %s, commit %s\n\n", m.CPU, m.CPUs, m.OS, m.Arch, m.GoVersion, shortCommit(m))
 
 	for i := range o.rounds {
-		// A fresh folder, so each round starts with an empty audit log and
-		// rounds don't affect each other.
-		roundDir := filepath.Join(dir, fmt.Sprintf("round%d", i+1))
-		if err := os.Mkdir(roundDir, 0o700); err != nil {
-			return err
-		}
-		gatewayArgs, err := loadtest.WriteGatewayFiles(roundDir, o.upstreamBin, auth.HashKey(key))
+		gatewayArgs, err := roundFiles(dir, i+1, o, key)
 		if err != nil {
 			return err
 		}
@@ -157,11 +158,22 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	return err
 }
 
+// roundFiles writes round n's gateway files in a fresh folder inside dir, so
+// each round starts with an empty audit log and rounds don't affect each
+// other. It returns the gateway's arguments.
+func roundFiles(dir string, n int, o options, key string) ([]string, error) {
+	roundDir := filepath.Join(dir, fmt.Sprintf("round%d", n))
+	if err := os.Mkdir(roundDir, 0o700); err != nil {
+		return nil, err
+	}
+	return loadtest.WriteGatewayFiles(roundDir, o.upstreamBin, auth.HashKey(key), o.policy)
+}
+
 // runRound measures both stdio targets, gateway first if gatewayFirst, then
 // HTTP throughput.
 func runRound(ctx context.Context, stdout io.Writer, o options, gatewayArgs []string, key string, gatewayFirst bool) (loadtest.Round, error) {
-	direct := loadtest.StdioTarget{Name: "direct", Command: upstream.Command{Path: o.upstreamBin}, Tool: "add"}
-	gateway := loadtest.StdioTarget{Name: "gateway", Command: upstream.Command{Path: o.gatewayBin, Args: gatewayArgs}, Tool: loadtest.UpstreamName + "__add"}
+	direct := loadtest.StdioTarget{Name: "direct", Command: upstream.Command{Path: o.upstreamBin}, Tool: loadtest.Tool}
+	gateway := loadtest.StdioTarget{Name: "gateway", Command: upstream.Command{Path: o.gatewayBin, Args: gatewayArgs}, Tool: loadtest.UpstreamName + "__" + loadtest.Tool}
 	order := []loadtest.StdioTarget{direct, gateway}
 	if gatewayFirst {
 		order = []loadtest.StdioTarget{gateway, direct}
@@ -210,7 +222,7 @@ func measureThroughput(ctx context.Context, stdout io.Writer, gatewayBin string,
 		}
 	}()
 
-	target := loadtest.HTTPTarget{URL: gw.URL, Key: key, Tool: loadtest.UpstreamName + "__add"}
+	target := loadtest.HTTPTarget{URL: gw.URL, Key: key, Tool: loadtest.UpstreamName + "__" + loadtest.Tool}
 	return runEach(stdout, clientCounts, func(clients int) (loadtest.Throughput, error) {
 		client := loadtest.NewHTTPClient(clients)
 		defer client.CloseIdleConnections()

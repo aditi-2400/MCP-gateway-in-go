@@ -41,14 +41,19 @@ run: build
 	@MCP_GATEWAY_API_KEY="$$($(GATEWAY) keygen -agent dev 2>>$(BIN_DIR)/run.yaml)" $(GATEWAY) -config $(BIN_DIR)/run.yaml -policy $(BIN_DIR)/run-policy.yaml -audit-db $(BIN_DIR)/audit.db
 
 # Measures the gateway (see cmd/loadtest) and saves every result as JSON in
-# bench/results, named by the UTC time it started. Takes a few minutes; close
-# other busy programs first. go build stamps the git commit into loadtest,
-# so the results say which code was measured.
+# bench/results, one file per policy (minimal, realistic), named by the UTC
+# time it started. Takes several minutes; close other busy programs first.
+# go build stamps the git commit into loadtest, so the results say which
+# code was measured.
 bench: build
 	go build -o $(BIN_DIR)/fakeupstream ./testdata/fakeupstream
 	go build -o $(BIN_DIR)/loadtest ./cmd/loadtest
 	@mkdir -p bench/results
-	$(BIN_DIR)/loadtest -out bench/results/$$(date -u +%Y%m%dT%H%M%SZ).json
+	@stamp=$$(date -u +%Y%m%dT%H%M%SZ); \
+	for policy in minimal realistic; do \
+		echo "== policy $$policy"; \
+		$(BIN_DIR)/loadtest -policy $$policy -out bench/results/$$stamp-$$policy.json || exit 1; \
+	done
 
 clean:
 	rm -rf $(BIN_DIR)

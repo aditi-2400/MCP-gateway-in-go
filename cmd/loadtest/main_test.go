@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -125,6 +126,9 @@ func TestRunRejectsBadFlags(t *testing.T) {
 		if err := run(context.Background(), []string{"-clients", clients}, &stdout, &stderr); err == nil {
 			t.Errorf("-clients %q: no error", clients)
 		}
+	}
+	if err := run(context.Background(), []string{"-policy", "strict"}, &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "minimal, realistic") {
+		t.Errorf("-policy strict: error = %v, want one listing the policies", err)
 	}
 	if err := run(context.Background(), []string{"extra"}, &stdout, &stderr); err == nil {
 		t.Error("extra argument: no error")
@@ -272,5 +276,74 @@ func TestWriteReportNeverOverwrites(t *testing.T) {
 	}
 	if data, _ := os.ReadFile(path); string(data) != "keep" {
 		t.Errorf("file now %q", data)
+	}
+}
+
+// A run with the realistic policy gets real calls through, so its checks
+// pass the benchmark call, and the saved results say which policy ran.
+func TestRunWithTheRealisticPolicy(t *testing.T) {
+	t.Setenv("MCP_GATEWAY_API_KEY", "")
+	out := filepath.Join(t.TempDir(), "results.json")
+	var stdout, stderr bytes.Buffer
+	err := run(context.Background(), []string{"-gateway", gatewayBin, "-upstream", fakeUpstreamBin, "-rounds", "1", "-policy", "realistic",
+		"-n", "20", "-warmup", "5", "-clients", "2", "-window", "200ms", "-http-warmup", "50ms", "-out", out}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run: %v\nstderr:\n%s", err, stderr.String())
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report loadtest.Report
+	if err := json.Unmarshal(data, &report); err != nil {
+		t.Fatalf("saved results: %v", err)
+	}
+	if report.Settings.Policy != "realistic" || len(report.Rounds) != 1 || report.Rounds[0].HTTP[0].Calls == 0 {
+		t.Errorf("report settings %+v, rounds %d", report.Settings, len(report.Rounds))
+	}
+}
+
+// argAfter returns the value after flag in args.
+func argAfter(t *testing.T, args []string, flag string) string {
+	t.Helper()
+	i := slices.Index(args, flag)
+	if i < 0 || i+1 >= len(args) {
+		t.Fatalf("args %q have no %s", args, flag)
+	}
+	return args[i+1]
+}
+
+// Each round writes the policy -policy names, and gets its own audit log.
+func TestRoundFiles(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		policy    string
+		hasChecks bool
+	}{{"minimal", false}, {"realistic", true}} {
+		o := options{upstreamBin: fakeUpstreamBin, policy: tc.policy}
+		first, err := roundFiles(filepath.Join(dir, tc.policy), 1, o, "k")
+		if err == nil {
+			t.Fatal("no error for a folder that does not exist")
+		}
+		if err := os.Mkdir(filepath.Join(dir, tc.policy), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if first, err = roundFiles(filepath.Join(dir, tc.policy), 1, o, "k"); err != nil {
+			t.Fatal(err)
+		}
+		second, err := roundFiles(filepath.Join(dir, tc.policy), 2, o, "k")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a, b := argAfter(t, first, "-audit-db"), argAfter(t, second, "-audit-db"); a == b {
+			t.Errorf("%s: rounds 1 and 2 share the audit log %s", tc.policy, a)
+		}
+		text, err := os.ReadFile(argAfter(t, first, "-policy"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Contains(string(text), "path_prefix"); got != tc.hasChecks {
+			t.Errorf("%s: policy has argument checks = %v, want %v:\n%s", tc.policy, got, tc.hasChecks, text)
+		}
 	}
 }
