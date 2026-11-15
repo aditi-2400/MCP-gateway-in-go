@@ -3,6 +3,7 @@ package fakeupstream
 import (
 	"encoding/json"
 	"strconv"
+	"time"
 
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
 )
@@ -60,6 +61,12 @@ var tools = []tool{
 			`"filter":{"type":"object","properties":{"owner":{"type":"string","x-mcp-header":"Owner"}}},` +
 			`"query":{"type":"string"}},"required":["region"]}`),
 		run: runLookup,
+	},
+	{
+		Name:        "sleep",
+		Description: "Waits ms milliseconds, then answers. This server handles one request at a time, so other requests wait too. Used to test timeouts.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"ms":{"type":"integer","minimum":1,"maximum":10000}},"required":["ms"]}`),
+		run:         runSleep,
 	},
 	{
 		Name:        "meta",
@@ -221,4 +228,15 @@ func runMeta(m traceMeta) callResult {
 	r := textResult(string(data))
 	r.StructuredContent = m
 	return r
+}
+
+func runSleep(args json.RawMessage, _ progressFunc) callResult {
+	var a struct {
+		Ms *int `json:"ms"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil || a.Ms == nil || *a.Ms < 1 || *a.Ms > 10000 {
+		return toolError("ms must be an integer from 1 to 10000")
+	}
+	time.Sleep(time.Duration(*a.Ms) * time.Millisecond)
+	return textResult("slept " + strconv.Itoa(*a.Ms) + "ms")
 }

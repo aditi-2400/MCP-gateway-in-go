@@ -7,6 +7,9 @@ upstreams:
   - name: fake
     command: ./bin/fakeupstream
     args: []
+    # Optional: how long one call to this upstream may take. Without it,
+    # only the gateway's -call-timeout applies.
+    timeout: 30s
 
 # Agents are the callers allowed in. Only the SHA-256 of each API key is
 # stored here. This hash belongs to a key nobody has; make your own with

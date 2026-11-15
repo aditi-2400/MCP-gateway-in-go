@@ -45,7 +45,7 @@ One gateway process serves either stdio or HTTP, picked with the `-http` flag.
 - **`internal/ratelimit`** sits between the policy and the router, so calls the policy denies never use up tokens. Each agent has a token bucket per tool. A call that finds its bucket empty gets error `-31029` and never reaches the upstream.
 - **`internal/metrics`** counts tool calls, denials, and latency for Prometheus. The audit layer tells it about every call it finishes.
 - **`internal/tracing`** records a span for each request (outside audit, so it covers the whole time in the gateway) and one for each upstream call. It also removes the trace context a client put in `_meta` before a call reaches an upstream, since that is untrusted.
-- **`internal/fakeupstream`** is a small MCP server with `echo`, `add`, and `fail` tools, used in tests.
+- **`internal/fakeupstream`** is a small MCP server with tools like `echo`, `add`, `fail`, and `sleep`, used in tests and benchmarks.
 
 When an upstream doesn't reply, the client gets a JSON-RPC error (`-32603`) saying "upstream timed out", "upstream unavailable", or "upstream error". The details go to the log only. Calls are never retried.
 
@@ -139,6 +139,7 @@ upstreams:
   - name: fs                      # tools show up as fs__<tool>
     command: /usr/local/bin/fs-server
     args: ["--root", "/tmp/agent-workspace"]
+    timeout: 10s                  # optional; see below
 
 agents:
   - name: ci-bot                  # who is calling; the policy refers to this name
@@ -146,6 +147,8 @@ agents:
 ```
 
 At least one agent is required. The file holds only the SHA-256 of each API key, never the key itself; a config with a raw `mcpgw_...` key in it is rejected.
+
+An upstream's `timeout` limits each call to it, both `tools/call` and `tools/list`. Without one, only `-call-timeout` (60s by default) applies; with both, the shorter one wins. A call that runs out of time gets `-32603` "upstream timed out", the upstream is told to stop with `notifications/cancelled`, and the call is never retried. In `tools/list`, an upstream that runs out of time is left out and the others are still listed. Write it with a unit (`500ms`, `10s`, `1m`); `0s` and negative values are rejected.
 
 ### API keys
 

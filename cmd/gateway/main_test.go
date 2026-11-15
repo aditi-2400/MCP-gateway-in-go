@@ -180,6 +180,7 @@ type upstreamEntry struct {
 	name    string
 	command string
 	args    []string
+	timeout string // written only when set, e.g. "100ms"
 }
 
 // writeConfig writes a gateway config to a temp file and returns its path.
@@ -195,6 +196,9 @@ func writeConfig(t *testing.T, upstreams ...upstreamEntry) string {
 			t.Fatal(err)
 		}
 		fmt.Fprintf(&b, "  - name: %s\n    command: %q\n    args: %s\n", u.name, u.command, args)
+		if u.timeout != "" {
+			fmt.Fprintf(&b, "    timeout: %s\n", u.timeout)
+		}
 	}
 	fmt.Fprintf(&b, "agents:\n  - name: tester\n    key_sha256: %s\n", auth.HashKey(testAPIKey))
 	dir := t.TempDir()

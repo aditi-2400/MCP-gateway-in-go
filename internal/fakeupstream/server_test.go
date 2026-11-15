@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
 )
@@ -125,8 +126,8 @@ func TestToolsList(t *testing.T) {
 		}
 	}
 	// Order must be stable so clients can cache the list.
-	if got := strings.Join(names, ","); got != "echo,add,fail,count,lookup,meta" {
-		t.Errorf("tool names = %s, want echo,add,fail,count,lookup,meta", got)
+	if got := strings.Join(names, ","); got != "echo,add,fail,count,lookup,sleep,meta" {
+		t.Errorf("tool names = %s, want echo,add,fail,count,lookup,sleep,meta", got)
 	}
 }
 
@@ -469,5 +470,27 @@ func TestMetaReturnsTheTraceKeysItGot(t *testing.T) {
 	decodeResult(t, serveOne(t, request(`2`, "tools/call", `"name":"meta"`)), &result)
 	if string(result.StructuredContent) != `{}` {
 		t.Errorf("with no trace keys, structuredContent = %s, want {}", result.StructuredContent)
+	}
+}
+
+func TestSleepWaitsThenAnswers(t *testing.T) {
+	start := time.Now()
+	var result decodedCallResult
+	decodeResult(t, serveOne(t, request(`1`, "tools/call", `"name":"sleep","arguments":{"ms":30}`)), &result)
+	if took := time.Since(start); took < 30*time.Millisecond {
+		t.Errorf("answered after %v, want at least 30ms", took)
+	}
+	if result.IsError {
+		t.Errorf("isError = true: %+v", result)
+	}
+}
+
+func TestSleepRejectsBadMs(t *testing.T) {
+	for _, args := range []string{`{}`, `{"ms":0}`, `{"ms":10001}`, `{"ms":"5"}`} {
+		var result decodedCallResult
+		decodeResult(t, serveOne(t, request(`1`, "tools/call", `"name":"sleep","arguments":`+args)), &result)
+		if !result.IsError {
+			t.Errorf("sleep %s: isError = false, want true", args)
+		}
 	}
 }

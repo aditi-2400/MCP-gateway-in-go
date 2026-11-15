@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // testHash is a well-formed key_sha256 (the SHA-256 of "abc").
@@ -51,6 +52,11 @@ upstreams:
 			want: []Upstream{{Name: "db", Command: "db-server", Args: []string{"--port", "5432"}}},
 		},
 		{
+			name: "timeout",
+			yaml: "upstreams:\n  - name: gh\n    command: x\n    timeout: 1m30s\n  - name: fs\n    command: y\n",
+			want: []Upstream{{Name: "gh", Command: "x", Timeout: ptr(90 * time.Second)}, {Name: "fs", Command: "y"}},
+		},
+		{
 			name: "longest allowed name",
 			yaml: "upstreams:\n  - name: " + strings.Repeat("a", maxNameLength) + "\n    command: x\n",
 			want: []Upstream{{Name: strings.Repeat("a", maxNameLength), Command: "x"}},
@@ -68,6 +74,8 @@ upstreams:
 		})
 	}
 }
+
+func ptr[T any](v T) *T { return &v }
 
 func TestParseInvalid(t *testing.T) {
 	tests := []struct {
@@ -97,6 +105,10 @@ func TestParseInvalid(t *testing.T) {
 		{name: "name starts with dash", yaml: "upstreams:\n  - name: -fs\n    command: x\n", wantErr: []string{`"-fs"`}},
 		{name: "space in name", yaml: "upstreams:\n  - name: \"f s\"\n    command: x\n", wantErr: []string{`"f s"`}},
 		{name: "name too long", yaml: "upstreams:\n  - name: " + strings.Repeat("a", maxNameLength+1) + "\n    command: x\n", wantErr: []string{"at most 32"}},
+		{name: "negative timeout", yaml: "upstreams:\n  - name: fs\n    command: x\n    timeout: -2s\n", wantErr: []string{"upstreams[0]", "timeout must be positive"}},
+		{name: "zero timeout", yaml: "upstreams:\n  - name: fs\n    command: x\n    timeout: 0s\n", wantErr: []string{"upstreams[0]", "timeout must be positive"}},
+		{name: "timeout without a unit", yaml: "upstreams:\n  - name: fs\n    command: x\n    timeout: 5\n", wantErr: []string{"parse"}},
+		{name: "timeout not a duration", yaml: "upstreams:\n  - name: fs\n    command: x\n    timeout: soon\n", wantErr: []string{"parse"}},
 		{
 			name:    "duplicate name",
 			yaml:    "upstreams:\n  - name: fs\n    command: x\n  - name: fs\n    command: y\n",

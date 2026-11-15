@@ -7,6 +7,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"go.yaml.in/yaml/v4"
 )
@@ -44,6 +45,9 @@ type Upstream struct {
 	// Command is the program to run. It is run directly, not through a shell.
 	Command string   `yaml:"command"`
 	Args    []string `yaml:"args"`
+	// Timeout limits each call to this upstream. Unset, only the gateway's
+	// -call-timeout applies; when both are set, the shorter one wins.
+	Timeout *time.Duration `yaml:"timeout"`
 }
 
 // Load reads and validates the config file at path.
@@ -166,6 +170,9 @@ func (u Upstream) validate() []error {
 	}
 	if strings.TrimSpace(u.Command) == "" {
 		errs = append(errs, errors.New("command is required"))
+	}
+	if u.Timeout != nil && *u.Timeout <= 0 {
+		errs = append(errs, fmt.Errorf("timeout must be positive, got %v; leave it out to use the gateway's -call-timeout", *u.Timeout))
 	}
 	return errs
 }

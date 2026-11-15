@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/jsonrpc"
 	"github.com/aditi-2400/MCP-gateway-in-go/internal/mcp"
@@ -40,6 +41,9 @@ type Upstream interface {
 type Named struct {
 	Name     string
 	Upstream Upstream
+	// Timeout limits each call to this upstream. Zero means no limit of its
+	// own; a shorter deadline already on the request still wins.
+	Timeout time.Duration
 }
 
 // Options configures a Router. Zero values pick defaults.
@@ -80,8 +84,19 @@ func New(upstreams []Named, opts Options) (*Router, error) {
 			return nil, fmt.Errorf("router: duplicate upstream name %q", u.Name)
 		case u.Upstream == nil:
 			return nil, fmt.Errorf("router: upstream %q is nil", u.Name)
+		case u.Timeout < 0:
+			return nil, fmt.Errorf("router: upstream %q has a negative timeout", u.Name)
 		}
 		byName[u.Name] = u.Upstream
+	}
+	// Wrapped once here, so every call to the upstream gets its timeout.
+	named := make([]Named, len(upstreams))
+	for i, u := range upstreams {
+		if u.Timeout > 0 {
+			u.Upstream = &timeoutUpstream{next: u.Upstream, timeout: u.Timeout}
+			byName[u.Name] = u.Upstream
+		}
+		named[i] = u
 	}
 
 	if opts.MaxPages <= 0 {
@@ -91,7 +106,7 @@ func New(upstreams []Named, opts Options) (*Router, error) {
 		opts.Logger = slog.New(slog.DiscardHandler)
 	}
 	return &Router{
-		upstreams: append([]Named(nil), upstreams...),
+		upstreams: named,
 		byName:    byName,
 		maxPages:  opts.MaxPages,
 		logger:    opts.Logger,
@@ -404,4 +419,17 @@ func resultMessage(v any) (*jsonrpc.Message, error) {
 
 func errorMessage(rpcErr *jsonrpc.Error) *jsonrpc.Message {
 	return &jsonrpc.Message{Error: rpcErr}
+}
+
+// timeoutUpstream gives every call to next its own deadline. If the request
+// already has an earlier one, context.WithTimeout keeps that one.
+type timeoutUpstream struct {
+	next    Upstream
+	timeout time.Duration
+}
+
+func (t *timeoutUpstream) Call(ctx context.Context, method string, params json.RawMessage) (*jsonrpc.Message, error) {
+	ctx, cancel := context.WithTimeout(ctx, t.timeout)
+	defer cancel()
+	return t.next.Call(ctx, method, params)
 }

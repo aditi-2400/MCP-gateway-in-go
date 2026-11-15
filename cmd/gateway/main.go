@@ -288,7 +288,11 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	}
 	for _, u := range cfg.Upstreams {
 		// Only the command is logged. Arguments can hold tokens.
-		logger.Info("upstream started", "upstream", u.Name, "command", u.Command)
+		attrs := []any{"upstream", u.Name, "command", u.Command}
+		if u.Timeout != nil {
+			attrs = append(attrs, "timeout", *u.Timeout)
+		}
+		logger.Info("upstream started", attrs...)
 	}
 
 	// Every upstream call goes through tracing.WrapUpstream, even with
@@ -298,7 +302,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	// so knownTool reads rt once it is set; no call runs before that.
 	var rt *router.Router
 	knownTool := func(name string) bool { return rt.KnownTool(name) }
-	rt, err = router.New(routes(group, tracer, knownTool), router.Options{Logger: logger.With("component", "router")})
+	rt, err = router.New(routes(group, cfg, tracer, knownTool), router.Options{Logger: logger.With("component", "router")})
 	if err != nil {
 		stopTracing()
 		return errors.Join(err, closeAudit(), group.Close())
@@ -404,12 +408,19 @@ func upstreamSpecs(cfg *config.Config) []upstream.Spec {
 	return specs
 }
 
-// routes names each upstream for the router, wrapped for tracing.
-func routes(g *upstream.Group, tracer trace.Tracer, knownTool func(string) bool) []router.Named {
+// routes names each upstream for the router, wrapped for tracing, with the
+// timeout its config entry sets (zero when it sets none).
+func routes(g *upstream.Group, cfg *config.Config, tracer trace.Tracer, knownTool func(string) bool) []router.Named {
+	timeouts := make(map[string]time.Duration, len(cfg.Upstreams))
+	for _, u := range cfg.Upstreams {
+		if u.Timeout != nil {
+			timeouts[u.Name] = *u.Timeout
+		}
+	}
 	members := g.Members()
 	named := make([]router.Named, len(members))
 	for i, m := range members {
-		named[i] = router.Named{Name: m.Name, Upstream: tracing.WrapUpstream(m.Name, m.Process, tracer, knownTool)}
+		named[i] = router.Named{Name: m.Name, Upstream: tracing.WrapUpstream(m.Name, m.Process, tracer, knownTool), Timeout: timeouts[m.Name]}
 	}
 	return named
 }
