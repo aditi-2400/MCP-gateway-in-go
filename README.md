@@ -323,6 +323,55 @@ Pick `mcp-gateway` under Service and click Find Traces. Jaeger keeps traces in m
 - The search only covers the Lookback window, "Last 1 hour" by default. Older traces are still there; make the window bigger to see them.
 - A span is named after its tool only once the gateway has fetched that upstream's tool list. Calls sent before that are named plain `tools/call`. The tool name is still in the `gen_ai.tool.name` attribute.
 
+## Benchmarks
+
+Measured with `make bench` on a MacBook Air (Apple M3, 8 cores, macOS), Go 1.26.4, at commit `61cd5be` with no uncommitted changes. Every result, down to each single call's time, is saved in [bench/results](bench/results), and the numbers below come from those two files.
+
+Each run has 5 rounds. The tables show the median round, with the lowest and highest round in brackets.
+
+### What is measured
+
+Every call is `tools/call` to the fake upstream's `echo` tool with a short path as the text. The fake upstream does almost no work, so what's left is the time the gateway itself adds: parsing, auth, policy, rate limit, audit, routing, and the extra pipe hop.
+
+- **Added latency (stdio).** 5,000 calls one at a time straight to the fake upstream, then 5,000 through the gateway, after 500 warm-up calls each. Added latency is the gateway's p50 (or p99) minus the direct one. The order flips each round so neither side always gets the warmer machine.
+- **Throughput (HTTP).** The gateway runs with `-http` on loopback, and 1, 8, or 32 clients send calls back to back for 5 seconds after a 1 second warm-up. Calls/s counts answered calls only.
+- **Two policies.** `minimal` allows every tool with no checks. `realistic` has two roles, the matching rule comes after three others, and the `text` argument is checked against a length limit, two allowed folders, and four deny patterns. Both have rate limits too high to reach, so the limiter does its work but never says no.
+
+### Results
+
+Added by the gateway over stdio, one call at a time (direct calls take about 22µs at p50):
+
+| Policy | p50 | p99 |
+|---|---|---|
+| minimal | 47.6µs [47.2 to 49.0] | 154.2µs [131.7 to 155.3] |
+| realistic | 53.2µs [51.9 to 65.2] | 159.6µs [153.5 to 225.7] |
+
+HTTP throughput:
+
+| Clients | minimal calls/s | realistic calls/s | p99 (minimal / realistic) |
+|---|---|---|---|
+| 1 | 10,412 [10,373 to 10,445] | 9,676 [9,530 to 9,879] | 0.24ms / 0.26ms |
+| 8 | 19,290 [19,198 to 19,357] | 17,924 [17,298 to 17,947] | 5.4ms / 5.4ms |
+| 32 | 20,063 [19,592 to 20,305] | 18,460 [17,357 to 19,140] | 13.9ms / 14.4ms |
+
+No call was refused in either run (about 2.4 million HTTP calls in all).
+
+### What the numbers say
+
+- The gateway adds under 0.1ms at p50 and under 0.25ms at p99 to a stdio call, in every round of both runs.
+- The realistic policy costs about 6µs per call and about 7% of throughput at 8 clients. The lowest-to-highest ranges of the two runs don't overlap, so the difference is bigger than the noise between rounds.
+- Throughput stops growing at about 8 clients. Past that, more clients only make each call wait longer (p99 goes from 5ms to 14ms).
+- The limit is the audit log. Measured on its own with `go test ./internal/audit -bench RecorderSQLite`, it saves about 30,000 to 37,000 entries/s on this laptop, while one upstream pipe handles about 120,000 calls/s (`go test ./internal/upstream -bench ConnCallsInParallel`). These two came from profiling at commit `7fcc2d6` and are not in the results files. Bigger batches and `synchronous=NORMAL` didn't help.
+- When calls come in faster than the log can save them, the audit queue fills and the gateway refuses calls with "audit log unavailable" instead of running them unrecorded. In earlier runs with 128 clients this happened, and rarely (3 calls in 250,000) it also happened with 1 client, which points to the writer sometimes pausing for about 100ms.
+
+### Caveats
+
+- One laptop, one run of each policy. Results move by a few percent between runs, and core placement on the M3 matters (running at background priority made everything 3 to 5 times slower).
+- Load clients, gateway, and upstream share the same 8 cores, so the gateway gets less CPU than it would on its own machine.
+- Everything is on loopback with a fake upstream. A real upstream doing real work will make the gateway's share of each call much smaller.
+
+To run it yourself, close busy programs and run `make bench`. It takes several minutes and writes two new files into `bench/results`. `bin/loadtest -h` lists the options.
+
 ## Known limits
 
 - If an upstream stops reading its stdin, a write to it can block the caller.
@@ -343,4 +392,4 @@ These are planned for Week 5.
 4. Rate limiting, audit log, metrics
 5. Timeouts, circuit breakers, description pinning, load tests, demo
 
-Benchmark numbers will be added here only after we measure them ourselves.
+Benchmark numbers are in [Benchmarks](#benchmarks).
